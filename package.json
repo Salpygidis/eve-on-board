@@ -1,0 +1,25 @@
+{
+  "name": "source-skirmish",
+  "version": "0.1.0",
+  "description": "SOURCE Skirmish — an EVE-inspired hex fleet game",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n server,client -c cyan,magenta \"node server/index.js\" \"vite --host\"",
+    "build": "vite build",
+    "start": "node server/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "vite": "^6.0.7"
+  }
+}
