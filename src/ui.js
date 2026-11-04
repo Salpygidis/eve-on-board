@@ -1,14 +1,15 @@
-import { NAMES } from "../shared/constants.js";
+import { MAX_PLAYERS, NAMES } from "../shared/constants.js";
 import {
+  AMMO,
+  AMMO_SPOTS,
   CATALOG,
   COLORS,
   MANEUVERS,
   MANEUVER_INFO,
   SHIPS,
   colorById,
-  costLabel,
 } from "../shared/catalog.js";
-import { statLine, travelLimit, validateFleet, validateOrders } from "../shared/rules.js";
+import { cardReach, isCooling, statLine, travelLimit, validateFleet, validateOrders } from "../shared/rules.js";
 import { previewPath, suggestAttacks, suggestOrders } from "../shared/ai.js";
 
 const $ = (id) => document.getElementById(id);
@@ -30,6 +31,7 @@ export const els = {
   btnBotsMore: $("btn-bots-more"),
   botCount: $("bot-count"),
   botRow: $("bot-row"),
+  seatRow: $("seat-row"),
   waitCode: $("wait-code"),
   waitRole: $("wait-role"),
   waitList: $("wait-list"),
@@ -88,12 +90,17 @@ export function renderLobbyList(lobby, youId) {
   els.botCount.textContent = String(bots);
   els.botRow.classList.toggle("hidden", !host || lobby.started);
   els.btnStart.classList.toggle("hidden", !host || lobby.started);
+  const offers = lobby.started ? [] : seatOffers(lobby.players, youId, false);
+  els.seatRow.classList.toggle("hidden", !offers.length);
+  els.seatRow.innerHTML = offers.map((offer) => seatButton(offer)).join("");
+  wireSeats(els.seatRow);
 }
 
 export function sync(state, session) {
   if (!state) return;
   viewSession = session;
-  const key = `${state.phase}:${state.round}:${session.playerId}:${state.fleetReady}:${state.ordersReady}:${state.attacksReady}:${state.status}`;
+  const seats = state.players.map((p) => `${p.id}:${p.isSpectator}:${p.isBot}:${p.name}`).join("|");
+  const key = `${state.phase}:${state.round}:${session.playerId}:${session.isSpectator}:${state.hostId}:${state.fleetReady}:${state.ordersReady}:${state.attacksReady}:${state.status}:${state.activation?.shipId || ""}:${seats}`;
   if (key !== formKey) {
     formKey = key;
     draft = seedDraft(state, session);
@@ -111,33 +118,49 @@ export function sync(state, session) {
 function seedDraft(state, session) {
   if (session.isSpectator) return null;
   if (state.phase === "fleet" && !state.fleetReady) {
-    return { fleet: (state.yourFleet || defaultFleet()).map((s) => ({ hull: s.hull, modules: [...s.modules] })) };
+    const saved = state.yourFleet;
+    return {
+      step: saved ? "racks" : "hull",
+      hullIndex: 0,
+      tab: "0",
+      fleet: (saved || [0, 1, 2]).map((s) => ({
+        hull: s.hull || null,
+        modules: [...(s.modules || [])],
+        ammo: [...(s.ammo || [])],
+      })),
+    };
   }
   if (state.phase === "orders" && !state.ordersReady) {
-    const suggested = suggestOrders(state, session.playerId);
+    const suggested = suggestOrders(state, session.playerId).map((order) => ({
+      ...order,
+      turn: 0,
+      turnDir: "none",
+      overdrive: null,
+      color: "lb",
+    }));
     return { tab: suggested[0]?.shipId || "", orders: suggested };
   }
   if (state.phase === "attack" && !state.attacksReady) {
-    return { attacks: suggestAttacks(state, session.playerId) };
+    return { attack: suggestAttacks(state, session.playerId) };
   }
   return null;
 }
 
-function defaultFleet() {
-  return [
-    { hull: "rifter", modules: ["blasters", "nano"] },
-    { hull: "rupture", modules: ["autocannons", "web", "dampener"] },
-    { hull: "tempest", modules: ["artillery", "extender"] },
-  ];
-}
-
 function renderForm(state, session) {
+  const fitting = !session.isSpectator && state.status !== "done" && state.phase === "fleet" && !state.fleetReady;
+  els.dock.classList.toggle("setup", fitting);
+  if (fitting) els.dock.classList.remove("collapsed");
   if (session.isSpectator) {
-    els.dock.innerHTML = `<p class="dock-lead">Watching the skirmish.</p>`;
+    const lead = state.status === "done" ? winText(state) : "Watching the skirmish.";
+    els.dock.innerHTML = `<p class="dock-lead">${esc(lead)}</p>${endActions(state, session)}`;
+    wireSeats(els.dock);
+    syncMarks(state, session);
     return;
   }
   if (state.status === "done") {
-    els.dock.innerHTML = `<p class="dock-lead">${esc(winText(state))}</p>`;
+    els.dock.innerHTML = `<p class="dock-lead">${esc(winText(state))}</p>${endActions(state, session)}`;
+    wireSeats(els.dock);
+    syncMarks(state, session);
     return;
   }
   if (state.phase === "fleet") {
@@ -147,41 +170,253 @@ function renderForm(state, session) {
   } else if (state.phase === "attack") {
     els.dock.innerHTML = state.attacksReady || !Object.keys(state.targets || {}).length
       ? `<p class="dock-lead">Volley locked.</p>`
-      : attackForm(state);
+      : attackForm(state, session);
   } else {
     els.dock.innerHTML = "";
   }
   wireForm(state, session);
+  syncTable(state, session);
+  syncMarks(state, session);
+}
+
+function syncMarks(state, session) {
+  if (state.phase === "orders" && !state.ordersReady && draft?.orders) {
+    const mine = myShips(state, session.playerId);
+    const tab = draft.tab || mine[0]?.id;
+    const ship = mine.find((s) => s.id === tab) || mine[0];
+    hooks.marks?.(ship ? { selected: ship.id } : null);
+    return;
+  }
+  const act = state.phase === "attack" ? state.activation : null;
+  if (!act) {
+    hooks.marks?.(null);
+    return;
+  }
+  const choosing = act.playerId === session.playerId && draft?.attack?.shipId === act.shipId;
+  hooks.marks?.({
+    shooter: act.shipId,
+    target: choosing ? draft.attack.targetId || "" : "",
+  });
 }
 
 function fleetForm(fleet) {
-  const cards = fleet.map((fit, index) => {
-    const hull = SHIPS[fit.hull];
-    const used = rackUsed(fit);
-    return `<section class="fit">
-      <header><span>Ship ${index + 1}</span><strong>${used}/${hull.racks} racks</strong></header>
-      <select data-hull="${index}">
-        ${Object.values(SHIPS).map((s) => `<option value="${s.id}" ${s.id === fit.hull ? "selected" : ""}>${s.name} · ${s.size} · spd ${s.speed} agi ${s.agility} · ${s.racks} racks</option>`).join("")}
-      </select>
-      <div class="chips">${moduleChips(fit, index)}</div>
-    </section>`;
-  }).join("");
-  const error = validateFleet(fleet);
-  return `${cards}<p class="form-error">${error ? esc(error) : "Three ships. Lock when the racks look right."}</p>
-    <button class="btn primary" data-act="fleet" type="button" ${error ? "disabled" : ""}>Lock fleet</button>`;
+  return draft.step === "racks" ? rackStep(fleet) : hullStep(fleet);
 }
 
-function moduleChips(fit, index) {
-  const size = SHIPS[fit.hull].size;
-  return Object.entries(CATALOG).map(([id, spec]) => {
-    const cost = spec.cost[size];
-    const on = fit.modules.includes(id);
-    const na = cost == null;
-    return `<button type="button" class="chip-btn ${on ? "on" : ""} ${na ? "na" : ""}" data-mod="${id}" data-slot="${index}" ${na ? "disabled" : ""}>
-      <b>${esc(spec.name)}</b>
-      <small>${spec.slot} · ${costLabel(spec.cost)}</small>
+function hullStep(fleet) {
+  const index = Math.max(0, Math.min(2, draft.hullIndex || 0));
+  const fit = fleet[index];
+  const looking = SHIPS[draft.hullLook] ? draft.hullLook : (fit.hull || "rifter");
+  const shown = SHIPS[looking];
+  const picks = Object.values(SHIPS).map((ship) => `<button type="button" class="hull-pick ${ship.id === fit.hull ? "on" : ""} ${ship.id === looking ? "look" : ""}" data-hull-pick="${ship.id}">
+      <img src="${ship.art}" alt="${esc(ship.name)}">
+      <span>${esc(ship.name)}</span>
+    </button>`).join("");
+  const progress = fleet.map((entry, i) => `Ship ${i + 1} ${entry.hull ? esc(SHIPS[entry.hull].name) : "—"}`).join(" · ");
+  const last = index === 2;
+  return `<p class="eyebrow">Ship ${index + 1} of 3</p>
+    <p class="hint">Point at a hull to read it, then choose it. Racks open after all three ships.</p>
+    <div class="fit-stage">
+      <div class="fit-picks">
+        <section class="fit-line">
+          <h3>Hulls</h3>
+          <div class="hand hull-row">${picks}</div>
+        </section>
+      </div>
+      <figure class="fit-preview">
+        <img src="${shown.art}" alt="${esc(shown.name)}">
+      </figure>
+    </div>
+    <p class="hint">${progress}</p>
+    <div class="row-btns">
+      ${index > 0 ? `<button type="button" class="btn ghost" data-setup="back">Back</button>` : ""}
+      <button type="button" class="btn primary" data-setup="next" ${fit.hull ? "" : "disabled"}>${last ? "Fit racks" : `Next · Ship ${index + 2}`}</button>
+    </div>`;
+}
+
+function rackStep(fleet) {
+  const slot = fleet[Number(draft.tab)] ? Number(draft.tab) : 0;
+  const fit = fleet[slot];
+  const hull = SHIPS[fit.hull];
+  const used = rackUsed(fit);
+  const ships = fleet.map((entry, index) => {
+    const chosen = SHIPS[entry.hull];
+    return `<button type="button" class="hull-pick ${index === slot ? "on" : ""}" data-ship-slot="${index}">
+      <img src="${chosen.art}" alt="${esc(chosen.name)}">
+      <span>${esc(chosen.name)}</span>
     </button>`;
   }).join("");
+  const shown = inspectedSpec();
+  const shownWide = shown.slot === "weapon" || inspectedId() === "bomb";
+  const error = validateFleet(fleet);
+  return `<p class="hint">${esc(hull.name)} · ${used}/${hull.racks} racks</p>
+    <div class="fit-stage rack-stage">
+      <section class="fit-line ship-line">
+        <h3>Ships</h3>
+        <div class="hand hull-row">${ships}</div>
+      </section>
+      <div class="fit-picks">
+        <section class="fit-line">
+          <h3>Weapons</h3>
+          <div class="hand">${catalogCards(fit, slot, "weapon")}</div>
+          ${ammoRow(fit)}
+        </section>
+        <section class="fit-line">
+          <h3>Modules</h3>
+          <div class="hand">${catalogCards(fit, slot, "module")}</div>
+        </section>
+      </div>
+      <figure class="fit-preview${shownWide ? " wide" : ""}">
+        ${cardFace(inspectedId(), shown.art, shown.name, chosenAmmo(fit, inspectedId()))}
+      </figure>
+    </div>
+    <p class="form-error">${error ? esc(error) : "Put an ammo token on each gun, then lock the fleet."}</p>
+    <div class="row-btns">
+      <button type="button" class="btn ghost" data-setup="hulls">Change hulls</button>
+      <button class="btn primary" data-act="fleet" type="button" ${error ? "disabled" : ""}>Lock fleet</button>
+    </div>`;
+}
+
+function catalogCards(fit, index, kind) {
+  const size = SHIPS[fit.hull].size;
+  return Object.entries(CATALOG)
+    .filter(([, spec]) => (kind === "weapon" ? spec.slot === "weapon" : spec.slot !== "weapon"))
+    .map(([id, spec]) => {
+      const cost = spec.cost[size];
+      const on = fit.modules.includes(id);
+      const na = cost == null;
+      const look = id === (draft.inspect || inspectedId());
+      const landscape = spec.slot === "weapon" || id === "bomb";
+      return `<button type="button" class="play-card${landscape ? " landscape" : ""} ${on ? "on" : ""} ${look ? "look" : ""} ${na ? "na" : ""}" data-mod="${id}" data-slot="${index}">
+      <img src="${spec.art}" alt="${esc(spec.name)}">
+      <span>${esc(spec.name)}</span>
+      <b>${na ? "NA" : cost}</b>
+    </button>`;
+    })
+    .join("");
+}
+
+function inspectedId() {
+  if (CATALOG[draft.inspect]) return draft.inspect;
+  return Object.keys(CATALOG).find((id) => CATALOG[id].slot === "weapon");
+}
+
+function inspectedSpec() {
+  return CATALOG[inspectedId()];
+}
+
+function focusHullCard(id) {
+  const ship = SHIPS[id];
+  if (!ship || draft.hullLook === id) return;
+  draft.hullLook = id;
+  const img = els.dock.querySelector(".fit-preview img");
+  if (img) {
+    img.src = ship.art;
+    img.alt = ship.name;
+  }
+  els.dock.querySelectorAll(".hull-pick.look").forEach((node) => node.classList.remove("look"));
+  els.dock.querySelector(`[data-hull-pick="${id}"]`)?.classList.add("look");
+}
+
+function chosenAmmo(fit, id) {
+  if (!fit || !CATALOG[id]) return "";
+  const index = fit.modules.indexOf(id);
+  if (index < 0) return "";
+  return fit.ammo?.[index] || CATALOG[id].ammo?.[0] || "";
+}
+
+function ammoSpot(id, ammoId) {
+  const spots = AMMO_SPOTS[id];
+  const index = CATALOG[id]?.ammo?.indexOf(ammoId);
+  if (!spots || index == null || index < 0) return null;
+  return spots[index] || null;
+}
+
+function ammoMark(id, ammoId) {
+  const spot = ammoSpot(id, ammoId);
+  if (!spot) return "";
+  return `<i class="ammo-mark" style="left:${spot[0]}%;top:${spot[1]}%" title="${esc(AMMO[ammoId]?.name || "")}"></i>`;
+}
+
+function cardFace(id, art, alt, ammoId) {
+  return `<div class="card-face"><img src="${art}" alt="${esc(alt)}">${ammoMark(id, ammoId)}</div>`;
+}
+
+function setAmmoMark(figure, id) {
+  const face = figure?.querySelector(".card-face");
+  if (!face) return;
+  face.querySelector(".ammo-mark")?.remove();
+  const slot = Number(draft.tab) || 0;
+  const spot = ammoSpot(id, chosenAmmo(draft.fleet?.[slot], id));
+  if (!spot) return;
+  const mark = document.createElement("i");
+  mark.className = "ammo-mark";
+  mark.style.left = `${spot[0]}%`;
+  mark.style.top = `${spot[1]}%`;
+  mark.title = AMMO[chosenAmmo(draft.fleet?.[slot], id)]?.name || "";
+  face.appendChild(mark);
+}
+
+function focusFitCard(id) {
+  const spec = CATALOG[id];
+  if (!spec || draft.inspect === id) return false;
+  draft.inspect = id;
+  const figure = els.dock.querySelector(".fit-preview");
+  const img = figure?.querySelector("img");
+  if (img) {
+    img.src = spec.art;
+    img.alt = spec.name;
+  }
+  figure?.classList.toggle("wide", spec.slot === "weapon" || id === "bomb");
+  setAmmoMark(figure, id);
+  els.dock.querySelectorAll(".play-card.look").forEach((node) => node.classList.remove("look"));
+  els.dock.querySelector(`[data-mod="${id}"]`)?.classList.add("look");
+  return true;
+}
+
+function rangeText(spec, color) {
+  const dists = [];
+  (spec.bands || []).forEach((band, index) => {
+    if (band && band[0] === color) dists.push(index);
+  });
+  if (!dists.length) return "";
+  const parts = [];
+  let start = dists[0];
+  let prev = dists[0];
+  for (let i = 1; i <= dists.length; i++) {
+    if (dists[i] === prev + 1) {
+      prev = dists[i];
+      continue;
+    }
+    parts.push(start === prev ? `${start}` : `${start}–${prev}`);
+    start = prev = dists[i];
+  }
+  return parts.join(", ");
+}
+
+function gunNotes(ship) {
+  const overcharge = ship.modules.includes("overcharge");
+  const lines = [];
+  ship.modules.forEach((id, index) => {
+    const spec = CATALOG[id];
+    if (spec?.slot !== "weapon") return;
+    const ammo = AMMO[ship.ammo?.[index]] || AMMO[spec.ammo?.[0]];
+    const red = rangeText(spec, "red");
+    const yellow = overcharge ? rangeText(spec, "yellow") : "";
+    lines.push(`<p><b>${esc(spec.name)}</b> ${esc(ammo?.name || "")} · red ${red || "—"}${yellow ? ` · OD red ${yellow}` : ""}</p>`);
+  });
+  if (!lines.length) return "";
+  return `<div class="gun-notes"><h3>Guns</h3>${lines.join("")}</div>`;
+}
+
+function ammoRow(fit) {
+  const rows = fit.modules.map((id, index) => {
+    const spec = CATALOG[id];
+    if (spec?.slot !== "weapon") return "";
+    const picked = fit.ammo?.[index] || spec.ammo[0];
+    return `<div class="ammo"><span>${esc(spec.name)}</span>${spec.ammo.map((ammo) => `<button type="button" data-ammo="${index}:${ammo}" class="${picked === ammo ? "on" : ""}">${esc(AMMO[ammo].name)}</button>`).join("")}</div>`;
+  }).join("");
+  return rows ? `<div class="ammo-row">${rows}</div>` : "";
 }
 
 function orderForm(state, session) {
@@ -195,11 +430,13 @@ function orderForm(state, session) {
     overdrive: order.overdrive,
     webbed: ship.webbed,
     energy: order.card === "hold" ? stats.energyMax : ship.energy,
-    odCooldown: order.card === "hold" ? false : ship.odCooldown,
+    odCooldown: order.card === "hold" ? false : isCooling(ship, "movement"),
   });
   const used = cardUse(draft.orders, ship.id);
+  const shown = order.card === "hold" ? order.holdSpend : order.card;
+  const shownInfo = MANEUVER_INFO[shown] || MANEUVER_INFO.approach;
   return `<div class="tabs">${mine.map((s) => `<button type="button" data-tab="${s.id}" class="${s.id === ship.id ? "on" : ""}">${esc(s.name)}</button>`).join("")}</div>
-    <p class="stat-line">${esc(ship.name)} · spd ${stats.speed} · agi ${stats.agility} · nrg ${ship.energy}/${stats.energyMax}${ship.webbed ? " · webbed" : ""}${ship.odCooldown ? " · OD cooling" : ""}</p>
+    <p class="stat-line">${esc(ship.name)} · spd ${stats.speed} · agi ${stats.agility} · nrg ${ship.energy}/${stats.energyMax}${ship.webbed ? " · webbed" : ""} ${odPips(ship)}</p>
     <div class="turn-row">
       <button type="button" data-turn="-1" aria-label="Fewer turns">−</button>
       <span class="tokens">${tokenStack(order.turn)}</span>
@@ -207,42 +444,58 @@ function orderForm(state, session) {
       <button type="button" data-dir="left" class="${order.turnDir === "left" ? "on" : ""}">Left</button>
       <button type="button" data-dir="right" class="${order.turnDir === "right" ? "on" : ""}">Right</button>
     </div>
-    <p class="hint">Up to ${stats.agility} faces. ${order.turn || 0} stacked.</p>
-    <div class="cards">${[...MANEUVERS, "hold"].map((id) => {
+    <p class="hint">Up to ${stats.agility} faces. ${order.turn || 0} stacked. Deck has 2 of each card.</p>
+    ${gunNotes(ship)}
+    <div class="hand">${MANEUVERS.map((id) => {
       const info = MANEUVER_INFO[id];
-      const left = id === "hold" ? "" : ` · ${2 - (used[id] || 0)}`;
-      const blocked = id !== "hold" && (used[id] || 0) >= 2 && order.card !== id;
-    return `<button type="button" data-card="${id}" class="${order.card === id ? "on" : ""}" ${blocked ? "disabled" : ""}>${info.name}${left}</button>`;
+      const using = order.card === id || (order.card === "hold" && order.holdSpend === id);
+      const left = 2 - (used[id] || 0) - (using ? 1 : 0);
+      const blocked = !using && (used[id] || 0) >= 2;
+      return `<button type="button" data-card="${id}" class="play-card ${order.card === id ? "on" : ""} ${order.card === "hold" && order.holdSpend === id ? "down" : ""}" ${blocked ? "disabled" : ""}>
+        <img src="${info.art}" alt="${esc(info.name)}">
+        <span>${esc(info.name)}</span>
+        <b>${copyPips(left)}</b>
+      </button>`;
     }).join("")}</div>
-    ${order.card === "hold" ? `<label class="field">Face-down card<select data-spend>${MANEUVERS.map((id) => `<option value="${id}" ${order.holdSpend === id ? "selected" : ""}>${MANEUVER_INFO[id].name}</option>`).join("")}</select></label>` : ""}
-    <div class="colors">${COLORS.map((c) => `<button type="button" data-color="${c.id}" class="color ${order.color === c.id ? "on" : ""}" style="--swatch:${c.hex}" ${c.dist > limit && order.card !== "hold" ? "disabled" : ""}>${c.name} ${c.dist}</button>`).join("")}</div>
+    <button type="button" data-card="hold" class="btn ${order.card === "hold" ? "primary" : "ghost"}">Hold · face down</button>
+    ${shownInfo.art ? `<figure class="card-sheet ${order.card === "hold" ? "down" : ""}"><img src="${shownInfo.art}" alt="${esc(shownInfo.name)}"><figcaption>${esc(shownInfo.blurb)}</figcaption></figure>` : ""}
+    <div class="colors">${COLORS.map((c) => {
+      const reach = cardReach(shown, c.id);
+      return `<button type="button" data-color="${c.id}" class="color ${order.color === c.id ? "on" : ""}" style="--swatch:${c.hex}" ${c.dist > limit && order.card !== "hold" ? "disabled" : ""}>${c.name} ${reach}</button>`;
+    }).join("")}</div>
     <div class="cards">${[["", "No Overdrive"], ["movement", "OD Move"], ["weapons", "OD Guns"], ["shield", "OD Shield"]].map(([id, label]) => `<button type="button" data-od="${id}" class="${(order.overdrive || "") === id ? "on" : ""}">${label}</button>`).join("")}</div>
-    <label class="field">Focus<select data-focus>${foeOptions(state, session.playerId, order.focusId)}</select></label>
     <label class="field">Active<select data-active>${activeOptions(ship, order)}</select></label>
     ${order.active?.id === "neut" || order.active?.id === "web" ? `<label class="field">Module target<select data-target>${foeOptions(state, session.playerId, order.active.targetId)}</select></label>` : ""}
     <button class="btn primary" data-act="orders" type="button">Lock orders</button>
     <button class="btn ghost" data-act="suggest" type="button">Suggest</button>`;
 }
 
-function attackForm(state) {
-  const rows = Object.entries(state.targets || {}).map(([shipId, targets]) => {
-    const ship = state.ships.find((s) => s.id === shipId);
-    const attack = draft.attacks.find((a) => a.shipId === shipId) || { shipId, weaponIndex: targets[0]?.weapons[0], targetId: targets[0]?.id };
-    const weapons = [];
-    ship.modules.forEach((id, index) => {
-      if (CATALOG[id]?.slot === "weapon") weapons.push({ index, name: CATALOG[id].name });
-    });
-    return `<section class="fit">
-      <header><span>${esc(ship.name)}</span><span>dmg ${ship.damage}</span></header>
-      <label class="field">Weapon<select data-weapon="${shipId}">${weapons.map((w) => `<option value="${w.index}" ${Number(attack.weaponIndex) === w.index ? "selected" : ""}>${w.name}</option>`).join("")}</select></label>
-      <label class="field">Target<select data-atk="${shipId}">${targets.map((t) => {
-        const foe = state.ships.find((s) => s.id === t.id);
-        return `<option value="${t.id}" ${attack.targetId === t.id ? "selected" : ""}>${esc(foe?.name || "Ship")} · ${t.dist} · ${foe?.transversal || "low"}</option>`;
-      }).join("")}</select></label>
-      ${ship.modules.includes("rapid") ? `<label class="field">If red, also fire<select data-follow="${shipId}"><option value="">No follow-up</option>${weapons.filter((w) => w.index !== Number(attack.weaponIndex)).map((w) => `<option value="${w.index}" ${Number(attack.followIndex) === w.index ? "selected" : ""}>${w.name}</option>`).join("")}</select></label>` : ""}
-    </section>`;
-  }).join("");
-  return `${rows}<button class="btn primary" data-act="attack" type="button">Fire</button>`;
+function attackForm(state, session) {
+  const act = state.activation;
+  if (!act) return `<p class="hint">Attack phase is settling.</p>`;
+  if (act.playerId !== session.playerId) return `<p class="hint">${esc(act.name)} is choosing a shot.</p>`;
+  const targets = state.targets?.[act.shipId] || [];
+  const ship = state.ships.find((s) => s.id === act.shipId);
+  if (!ship) return `<p class="hint">That ship is gone.</p>`;
+  const attack = draft.attack?.shipId === ship.id ? draft.attack : { shipId: ship.id, weaponIndex: targets[0]?.weapons[0], targetId: targets[0]?.id };
+  draft.attack = attack;
+  const weapons = [];
+  ship.modules.forEach((id, index) => {
+    if (CATALOG[id]?.slot === "weapon") weapons.push({ index, name: CATALOG[id].name, art: CATALOG[id].art, ammo: ship.ammo?.[index] });
+  });
+  const chosen = weapons.find((w) => w.index === Number(attack.weaponIndex)) || weapons[0];
+  return `<section class="fit">
+    <header><span>${esc(ship.name)} fires</span><span>${esc(chosen?.ammo ? AMMO[chosen.ammo]?.name || "" : "")}</span></header>
+    ${chosen ? `<div class="card-sheet">${cardFace(ship.modules[chosen.index], chosen.art, chosen.name, chosen.ammo)}</div>` : ""}
+    <label class="field">Weapon<select data-weapon="${ship.id}">${weapons.map((w) => `<option value="${w.index}" ${Number(attack.weaponIndex) === w.index ? "selected" : ""}>${w.name}</option>`).join("")}</select></label>
+    <label class="field">Target<select data-atk="${ship.id}">${targets.map((t) => {
+      const foe = state.ships.find((s) => s.id === t.id);
+      return `<option value="${t.id}" ${attack.targetId === t.id ? "selected" : ""}>${esc(foe?.name || "Ship")} · ${t.dist}</option>`;
+    }).join("")}</select></label>
+    ${ship.modules.includes("rapid") ? `<label class="field">If red, also fire<select data-follow="${ship.id}"><option value="">No follow-up</option>${weapons.filter((w) => w.index !== Number(attack.weaponIndex)).map((w) => `<option value="${w.index}" ${Number(attack.followIndex) === w.index ? "selected" : ""}>${w.name}</option>`).join("")}</select></label>` : ""}
+  </section>
+  <button class="btn primary" data-act="attack" type="button">Fire</button>
+  <button class="btn ghost" data-act="pass" type="button">Pass</button>`;
 }
 
 function wireForm(state, session) {
@@ -266,21 +519,71 @@ function wireForm(state, session) {
       renderForm(state, session);
     }
     if (t.dataset.target != null && currentOrder().active) currentOrder().active.targetId = t.value;
-    if (t.dataset.weapon != null) {
-      const attack = attackOf(t.dataset.weapon);
-      attack.weaponIndex = Number(t.value);
+    if (t.dataset.weapon != null && draft.attack) {
+      draft.attack.weaponIndex = Number(t.value);
+      renderForm(state, session);
     }
-    if (t.dataset.atk != null) attackOf(t.dataset.atk).targetId = t.value;
-    if (t.dataset.follow != null) {
-      const attack = attackOf(t.dataset.follow);
-      attack.followIndex = t.value === "" ? null : Number(t.value);
-      attack.followTargetId = attack.targetId;
+    if (t.dataset.atk != null && draft.attack) draft.attack.targetId = t.value;
+    if (t.dataset.follow != null && draft.attack) {
+      draft.attack.followIndex = t.value === "" ? null : Number(t.value);
+      draft.attack.followTargetId = draft.attack.targetId;
     }
+  };
+  els.dock.onpointerover = (e) => {
+    if (!draft) return;
+    const card = e.target.closest("[data-mod]");
+    if (card && draft.step === "racks" && focusFitCard(card.dataset.mod)) syncTable(state, session);
+    const hull = e.target.closest("[data-hull-pick]");
+    if (hull && draft.step !== "racks") focusHullCard(hull.dataset.hullPick);
   };
   els.dock.onclick = (e) => {
     const btn = e.target.closest("button");
     if (!btn) return;
     if (btn.dataset.mod) return toggleMod(state, session, btn);
+    if (btn.dataset.ammo) {
+      const [index, ammo] = btn.dataset.ammo.split(":");
+      const fit = draft.fleet[Number(draft.tab) || 0];
+      fit.ammo = fit.ammo || [];
+      fit.ammo[Number(index)] = ammo;
+      renderForm(state, session);
+      return;
+    }
+    if (btn.dataset.hullPick) {
+      const index = draft.step === "racks" ? Number(draft.tab) || 0 : (draft.hullIndex || 0);
+      draft.hullLook = btn.dataset.hullPick;
+      setHull(index, btn.dataset.hullPick);
+      renderForm(state, session);
+      return;
+    }
+    if (btn.dataset.setup === "back") {
+      draft.hullIndex = Math.max(0, (draft.hullIndex || 0) - 1);
+      draft.hullLook = draft.fleet[draft.hullIndex]?.hull || null;
+      renderForm(state, session);
+      return;
+    }
+    if (btn.dataset.setup === "next") {
+      const index = draft.hullIndex || 0;
+      if (!draft.fleet[index]?.hull) return;
+      draft.hullLook = null;
+      if (index < 2) draft.hullIndex = index + 1;
+      else {
+        draft.step = "racks";
+        draft.tab = "0";
+      }
+      renderForm(state, session);
+      return;
+    }
+    if (btn.dataset.setup === "hulls") {
+      draft.step = "hull";
+      draft.hullIndex = Number(draft.tab) || 0;
+      renderForm(state, session);
+      return;
+    }
+    if (btn.dataset.shipSlot != null) {
+      draft.tab = btn.dataset.shipSlot;
+      renderForm(state, session);
+      return;
+    }
     if (btn.dataset.tab) {
       draft.tab = btn.dataset.tab;
       renderForm(state, session);
@@ -297,8 +600,19 @@ function wireForm(state, session) {
     }
     if (btn.dataset.card) {
       const order = currentOrder();
-      order.card = btn.dataset.card;
-      if (order.card === "hold" && !order.holdSpend) order.holdSpend = "approach";
+      if (btn.dataset.card === "hold") {
+        if (order.card === "hold") order.card = order.holdSpend || "approach";
+        else {
+          order.holdSpend = MANEUVERS.includes(order.card) ? order.card : (order.holdSpend || "approach");
+          order.card = "hold";
+          order.overdrive = null;
+          order.active = null;
+        }
+      } else if (order.card === "hold") {
+        order.holdSpend = btn.dataset.card;
+      } else {
+        order.card = btn.dataset.card;
+      }
       renderForm(state, session);
       publishPreview(state, session);
       return;
@@ -327,19 +641,47 @@ function wireForm(state, session) {
       renderForm(state, session);
       publishPreview(state, session);
     }
-    if (btn.dataset.act === "attack") hooks.attack?.(draft.attacks);
+    if (btn.dataset.act === "attack") hooks.attack?.(draft.attack);
+    if (btn.dataset.act === "pass") hooks.attack?.({ shipId: state.activation?.shipId, pass: true });
   };
+}
+
+function setHull(index, hullId) {
+  const fit = draft.fleet[index];
+  const size = SHIPS[hullId].size;
+  const modules = [];
+  const ammo = [];
+  (fit.modules || []).forEach((id, i) => {
+    if (CATALOG[id]?.cost[size] != null) {
+      modules.push(id);
+      ammo.push(fit.ammo?.[i] ?? null);
+    }
+  });
+  fit.hull = hullId;
+  fit.modules = modules;
+  fit.ammo = ammo;
+  while (rackUsed(fit) > SHIPS[hullId].racks) {
+    fit.modules.pop();
+    fit.ammo.pop();
+  }
 }
 
 function toggleMod(state, session, btn) {
   const fit = draft.fleet[Number(btn.dataset.slot)];
   const id = btn.dataset.mod;
-  if (fit.modules.includes(id)) fit.modules = fit.modules.filter((m) => m !== id);
-  else {
+  draft.inspect = id;
+  fit.ammo = fit.ammo || [];
+  if (fit.modules.includes(id)) {
+    const at = fit.modules.indexOf(id);
+    fit.modules.splice(at, 1);
+    fit.ammo.splice(at, 1);
+  } else {
+    const spec = CATALOG[id];
     const next = [...fit.modules, id];
     const trial = draft.fleet.map((s, i) => i === Number(btn.dataset.slot) ? { ...s, modules: next } : s);
     if (validateFleet(trial)) return toast(validateFleet(trial));
     fit.modules = next;
+    fit.ammo.push(spec?.slot === "weapon" ? spec.ammo[0] : null);
   }
   renderForm(state, session);
 }
@@ -359,16 +701,96 @@ function currentOrder() {
   return draft.orders.find((o) => o.shipId === draft.tab) || draft.orders[0];
 }
 
-function attackOf(shipId) {
-  let attack = draft.attacks.find((a) => a.shipId === shipId);
-  if (!attack) {
-    attack = { shipId, weaponIndex: 0, targetId: "" };
-    draft.attacks.push(attack);
+function syncTable(state, session) {
+  if (session.isSpectator || state.status === "done") {
+    hooks.table?.([]);
+    return;
   }
-  return attack;
+  if (state.phase === "orders" && draft?.orders) {
+    hooks.table?.(draft.orders.map((order) => {
+      const ship = state.ships.find((s) => s.id === order.shipId);
+      const shown = order.card === "hold" ? "" : order.card;
+      const info = MANEUVER_INFO[shown];
+      return {
+        shipId: order.shipId,
+        name: ship?.name || "Ship",
+        art: info?.art || "",
+        facedown: order.card === "hold",
+        color: colorById(order.color)?.hex || "",
+        turn: order.turn || 0,
+        turnDir: order.turnDir || "none",
+        overdrive: order.overdrive || "",
+        focus: order.shipId === draft.tab,
+      };
+    }), draft.tab);
+    return;
+  }
+  if (state.phase === "orders") return;
+  if (state.phase === "fleet" && !state.fleetReady && draft?.fleet) {
+    const mine = myShips(state, session.playerId);
+    const cards = [];
+    const slot = Number(draft.tab) || 0;
+    draft.fleet.forEach((fit, index) => {
+      if (!fit.hull) return;
+      const looking = SHIPS[draft.hullLook] ? draft.hullLook : fit.hull;
+      cards.push({
+        shipId: mine[index]?.id || `hull-${index}`,
+        name: `Ship ${index + 1}`,
+        art: SHIPS[fit.hull].art,
+        row: draft.step === "racks" ? "ship" : "",
+        focus: draft.step === "racks" ? index === slot : draft.step !== "racks" && index === (draft.hullIndex || 0) && looking === fit.hull,
+      });
+    });
+    if (draft.step === "racks") {
+      const fit = draft.fleet[slot];
+      const ship = mine[slot];
+      const seen = new Set();
+      const pushGear = (id, focus) => {
+        const spec = CATALOG[id];
+        if (!spec || seen.has(id)) return;
+        seen.add(id);
+        const fitted = (fit?.modules || []).indexOf(id);
+        const ammoId = fitted >= 0 ? (fit.ammo?.[fitted] || spec.ammo?.[0] || "") : "";
+        cards.push({
+          shipId: ship?.id || "rack",
+          name: spec.name,
+          art: spec.art,
+          row: "gear",
+          wide: spec.slot === "weapon" || id === "bomb",
+          spot: ammoSpot(id, ammoId),
+          focus,
+        });
+      };
+      (fit?.modules || []).forEach((id) => pushGear(id, id === draft.inspect));
+      if (draft.inspect) pushGear(draft.inspect, true);
+    } else if (!cards.length) {
+      const ship = SHIPS[draft.hullLook] || SHIPS.rifter;
+      cards.push({ shipId: "hull", name: ship.name, art: ship.art, focus: true });
+    }
+    hooks.table?.(cards);
+    return;
+  }
+  if (state.phase === "attack" && draft?.attack && !draft.attack.pass) {
+    const ship = state.ships.find((s) => s.id === draft.attack.shipId);
+    const weapon = ship && CATALOG[ship.modules?.[draft.attack.weaponIndex]];
+    if (weapon?.art) {
+      const weaponId = ship.modules[Number(draft.attack.weaponIndex)];
+      hooks.table?.([{
+        shipId: ship.id,
+        name: weapon.name,
+        art: weapon.art,
+        wide: true,
+        spot: ammoSpot(weaponId, ship.ammo?.[Number(draft.attack.weaponIndex)]),
+        focus: true,
+      }]);
+      return;
+    }
+  }
+  hooks.table?.([]);
 }
 
 function publishPreview(state, session) {
+  syncTable(state, session);
   if (state.phase !== "orders" || !draft?.orders) {
     hooks.preview?.([]);
     return;
@@ -400,7 +822,7 @@ function renderChrome(state, session) {
       const ready = state.phase === "fleet" ? p.fleetReady : state.phase === "orders" ? p.ordersReady : p.attacksReady;
       return `<article class="pilot" style="--pilot:${p.color.hex}">
         <header><b>${esc(p.name)}</b>${ready ? "<span>locked</span>" : ""}</header>
-        ${ships.map((s) => `<p><span>${esc(s.name)}</span> ${pipRow(s.shield, s.shieldMax, "shield")} ${pipRow(s.hullHp, s.hullMax, "hull")} <em>${s.energy} nrg</em></p>`).join("") || "<p>Fitting…</p>"}
+        ${ships.map((s) => `<p><span>${esc(s.name)}</span> ${pipRow(s.shield, s.shieldMax, "shield")} ${pipRow(s.armor, s.armorMax, "armor")} ${pipRow(s.hullHp, s.hullMax, "hull")} <em>${s.energy} nrg</em></p>`).join("") || "<p>Fitting…</p>"}
       </article>`;
     }).join("");
   els.log.innerHTML = (state.log || []).slice(-8).map((line) => `<p>${esc(line)}</p>`).join("");
@@ -430,32 +852,67 @@ export function focusFromPointer(state, session, shipId) {
 }
 
 export function targetFromPointer(state, shipId) {
-  if (!draft?.attacks || state.phase !== "attack") return;
+  if (!draft?.attack || state.phase !== "attack") return;
   const ship = state.ships.find((s) => s.id === shipId);
-  if (!ship) return;
-  const attackers = Object.keys(state.targets || {});
-  if (attackers.includes(shipId)) return;
-  const owner = draft.attacks.find((a) => state.targets[a.shipId]?.some((t) => t.id === shipId));
-  const attack = owner || draft.attacks[0];
-  if (!attack) return;
-  if (!state.targets[attack.shipId]?.some((t) => t.id === shipId)) return toast("Out of range.");
-  attack.targetId = shipId;
+  if (!ship || ship.id === state.activation?.shipId) return;
+  if (!state.targets[draft.attack.shipId]?.some((t) => t.id === shipId)) return toast("Out of range.");
+  draft.attack.targetId = shipId;
   renderForm(state, viewSession);
 }
 
 function showWin(state, session) {
-  const host = session.playerId === state.hostId;
   els.modal.classList.remove("hidden");
   els.modal.innerHTML = `<div class="panel modal-panel">
     <p class="eyebrow">skirmish over</p>
     <h2>${esc(winText(state))}</h2>
+    ${endActions(state, session)}
     <div class="row-btns">
-      ${host ? `<button id="btn-again" class="btn primary" type="button">Play again</button>` : ""}
       <button id="close-modal" class="btn ghost" type="button">Close</button>
     </div>
   </div>`;
+  wireSeats(els.modal);
   $("close-modal").onclick = () => els.modal.classList.add("hidden");
-  $("btn-again")?.addEventListener("click", () => hooks.again?.());
+}
+
+function seatOffers(players, youId, playing) {
+  const you = players.find((p) => p.id === youId);
+  if (!you?.isSpectator) return [];
+  const pilots = players.filter((p) => !p.isSpectator);
+  const bots = pilots.filter((p) => p.isBot);
+  if (bots.length) {
+    return bots.map((p) => ({ id: p.id, label: bots.length > 1 ? `Swap in for ${p.name}` : "Swap in" }));
+  }
+  const empty = pilots.filter((p) => !p.connected);
+  if (empty.length) return empty.map((p) => ({ id: p.id, label: `Take ${p.name}'s seat` }));
+  if (!playing && pilots.length < MAX_PLAYERS) return [{ id: "open", label: "Take a seat" }];
+  if (!playing) return pilots.map((p) => ({ id: p.id, label: `Swap with ${p.name}` }));
+  return [];
+}
+
+function seatButton(offer) {
+  return `<button data-seat="${esc(offer.id)}" class="btn" type="button">${esc(offer.label)}</button>`;
+}
+
+function endActions(state, session) {
+  const offers = seatOffers(state.players, session.playerId, state.status === "playing");
+  const replay = state.status === "done" && session.playerId === state.hostId;
+  if (!replay && !offers.length) return "";
+  return `<div class="row-btns end-actions">
+    ${replay ? `<button data-act="again" class="btn primary" type="button">Replay</button>` : ""}
+    ${offers.map((offer) => seatButton(offer)).join("")}
+  </div>`;
+}
+
+function wireSeats(root) {
+  root.querySelectorAll("[data-seat]").forEach((btn) => {
+    btn.onclick = () => hooks.seat?.(btn.dataset.seat === "open" ? "" : btn.dataset.seat);
+  });
+  root.querySelectorAll("[data-act=again]").forEach((btn) => {
+    btn.onclick = () => {
+      els.modal.classList.add("hidden");
+      hooks.again?.();
+    };
+  });
 }
 
 export function showHow() {
@@ -463,12 +920,11 @@ export function showHow() {
   els.modal.innerHTML = `<div class="panel modal-panel rules">
     <p class="eyebrow">how to play</p>
     <h2>SOURCE Skirmish</h2>
-    <p>Each pilot brings 3 ships: any mix of Rifter, Rupture, and Tempest. Modules spend racks. A dash means that hull cannot fit it.</p>
-    <p>Every round is secret. For each ship choose a facing change (stacked turn tokens, up to Agility), a maneuver, and a color. You have two of each maneuver. Hold spends one card face-down: energy refills, +1 shield, and spent modules and Overdrive reset.</p>
-    <p>Light Blue moves 1, Light Green 2, Yellow 3. Red moves 4 and requires Overdrive Movement. Speed is the furthest color you can play without Overdrive. Overdrive costs 1 energy, once per ship until you Hold. Movement adds a color, Weapons adds 2 damage, Shield restores 1.</p>
-    <p>Approach and Keep at Range are low transversal. Orbit and Strafe are high. Inside optimal with low transversal is a red hit (full damage). Other shots in range are yellow (damage − 1) or a miss. Outside falloff misses. Guns have no facing arc.</p>
-    <p>Ships that end on the same hex, or trade places, collide. Both take 1 hull. The smaller ship takes 1 more per size step. Shields do not stop collisions. Knockback equals the hull lost, then each ship may twist one face.</p>
-    <p>A ship at 0 hull is destroyed. If the collision killed it, it does not shoot. Otherwise it still fires. Last fleet flying wins.</p>
+    <p>Choose ship 1, ship 2, and ship 3. Any mix of Small, Medium, and Large. Then fit each ship: weapons on one line, modules on another, up to the rack limit. Put an ammo token on each gun for the whole match.</p>
+    <p>Hidden phase: turn tokens up to Agility, one movement card face-down, and a color token on that card. Speed 1 reaches blue, 2 green, 3 yellow. Speed 4 or Overdrive Movement reaches red. One Overdrive per ship. Smart Bomb and Stealth are played here.</p>
+    <p>Everyone moves at once. Ships that cross or finish on the same hex collide immediately. Then ships take turns firing one weapon. A red-zone hit can trigger Rapid Weapons. Armor reduces a hit by 1 when the first point lands on armor. An ammo bonus applies only when that first point hits its layer.</p>
+    <p>Hold is a face-down card and a full skip. If the ship is still alive after the shooting, it refills energy, gains 1 shield, and resets modules and Overdrive. Auxiliary Armor Repairer also restores 1 armor.</p>
+    <p>Last fleet flying wins.</p>
     <button id="close-modal" class="btn primary" type="button">Close</button>
   </div>`;
   $("close-modal").onclick = () => els.modal.classList.add("hidden");
@@ -499,6 +955,16 @@ function cardUse(orders, exceptId) {
   return used;
 }
 
+function odPips(ship) {
+  const cool = ship.odCool || {};
+  const labels = [["movement", "Speed"], ["shield", "Shields"], ["weapons", "Damage"]];
+  return `<span class="od-pips">${labels.map(([id, label]) => `<i class="${cool[id] ? "hot" : ""}">${label}</i>`).join("")}</span>`;
+}
+
+function copyPips(left) {
+  return `${"●".repeat(Math.max(0, left))}${"○".repeat(Math.max(0, 2 - left))}`;
+}
+
 function tokenStack(n) {
   const count = Math.max(0, n || 0);
   if (!count) return "<i>0</i>";
@@ -517,7 +983,7 @@ function firstFoe(state, playerId) {
 
 function activeOptions(ship, order) {
   const actives = ship.modules.filter((id) => CATALOG[id]?.slot === "active");
-  const fresh = actives.filter((id) => order.card === "hold" || !ship.spent?.[id]);
+  const fresh = order.card === "hold" ? [] : actives.filter((id) => !ship.spent?.[id]);
   const current = order.active?.id || "";
   return `<option value="">No active</option>${fresh.map((id) => `<option value="${id}" ${id === current ? "selected" : ""}>${CATALOG[id].name}</option>`).join("")}`;
 }

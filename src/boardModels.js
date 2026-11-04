@@ -3,7 +3,6 @@ import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { HEX_SIZE, hexRound, hexToWorld, key } from "../shared/hex.js";
 import {
   FOUNDATION_FLOOR_Y,
-  FOUNDATION_PITCH,
   FOUNDATION_RIM_Y,
   foundationPose,
 } from "../shared/boardFit.js";
@@ -190,7 +189,7 @@ async function loadObj(url) {
 }
 
 export async function loadBoardModels() {
-  const [foundation, liquid, height, metrics, waterMap, rockMap, crystalMap, grassMap] = await Promise.all([
+  const [foundation, liquid, height, metrics, waterMap, rockMap, crystalMap, spaceMap] = await Promise.all([
     loadObj("/models/foundation.obj"),
     loadObj("/models/liquid.obj"),
     loadObj("/models/height.obj"),
@@ -198,7 +197,7 @@ export async function loadBoardModels() {
     loadTexture("/textures/water.jpg"),
     loadTexture("/textures/rocks.jpg"),
     loadTexture("/textures/crystal.jpg"),
-    loadTexture("/textures/grass.jpg", true),
+    loadTexture("/textures/space.jpg?v=3"),
   ]); 
   const liquidMat = new THREE.MeshStandardMaterial({
     color: "#3ec8ea",
@@ -218,16 +217,16 @@ export async function loadBoardModels() {
     foundation,
     liquid,
     height,
-    foundationTop: topCapGeometry(foundation, FOUNDATION_TOP, { repeat: FOUNDATION_PITCH }),
+    foundationTop: topCapGeometry(foundation, FOUNDATION_TOP),
     liquidTop: topCapGeometry(liquid, LIQUID_TOP),
     heightTop: topCapGeometry(height, HEIGHT_TOP),
     foundationMat: new THREE.MeshStandardMaterial({
-      color: "#6fbf63",
-      roughness: 0.82,
-      metalness: 0.02,
+      color: "#140e28",
+      roughness: 0.9,
+      metalness: 0.04,
       side: THREE.DoubleSide,
     }),
-    grassTopMat: photoMaterial(grassMap),
+    spaceTopMat: photoMaterial(spaceMap),
     liquidMat,
     waterTopMat,
     crystalTopMat,

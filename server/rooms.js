@@ -161,6 +161,112 @@ export class RoomManager {
     return { room };
   }
 
+  takeSeat(socket, { seatId } = {}) {
+    const ctx = this.bySocket.get(socket.id);
+    if (!ctx) return { error: "Join a room first." };
+    const room = this.rooms.get(ctx.code);
+    if (!room) return { error: "Room is gone." };
+    const spectator = room.lobby.find((p) => p.id === ctx.playerId);
+    if (!spectator || spectator.isBot) return { error: "Join a room first." };
+    if (!spectator.isSpectator) return { error: "You already have a seat." };
+
+    const pilots = room.lobby.filter((p) => !p.isSpectator);
+    const playing = !!(room.game && room.game.status === "playing");
+    const wanted = seatId ? room.lobby.find((p) => p.id === seatId) : null;
+    if (seatId && (!wanted || wanted.isSpectator)) return { error: "That seat is gone." };
+
+    const seat = wanted || pilots.find((p) => p.isBot) || pilots.find((p) => !p.isBot && !p.socketId);
+    if (!seat) {
+      if (!playing && pilots.length < MAX_PLAYERS) {
+        spectator.isSpectator = false;
+        this.reflectPromoted(room, spectator);
+        this.touch(room);
+        return { room, player: spectator };
+      }
+      return { error: playing ? "No open seat during the fight." : "The table is full. Swap with a pilot." };
+    }
+    if (!seat.isBot && seat.socketId && playing) return { error: "That pilot is still in the fight." };
+
+    const displaced = !!(seat.socketId && !seat.isBot);
+    const oldName = seat.name;
+    if (room.game) this.handFleet(room.game, spectator, seat, displaced ? oldName : null);
+
+    spectator.isSpectator = false;
+    if (displaced) {
+      seat.isSpectator = true;
+      seat.isBot = false;
+      if (room.hostId === seat.id) {
+        room.hostId = spectator.id;
+        if (room.game) room.game.hostId = spectator.id;
+      }
+    } else {
+      room.lobby = room.lobby.filter((p) => p.id !== seat.id);
+      if (room.game) room.game.players = room.game.players.filter((p) => p.id !== seat.id);
+    }
+
+    if (room.game && room.game.status === "playing") {
+      this.armTimer(room);
+      this.scheduleBot(room);
+    }
+    this.touch(room);
+    return { room, player: spectator };
+  }
+
+  handFleet(game, spectator, seat, displacedName) {
+    const seatP = game.playerById(seat.id);
+    if (!seatP) return;
+    let specP = game.playerById(spectator.id);
+    if (!specP) {
+      specP = { id: spectator.id };
+      game.players.push(specP);
+    }
+    specP.name = spectator.name;
+    specP.isSpectator = false;
+    specP.isBot = false;
+    specP.connected = true;
+    specP.color = seatP.color;
+    specP.fleetReady = seatP.fleetReady;
+    specP.ordersReady = seatP.ordersReady;
+    specP.attacksReady = seatP.attacksReady;
+    specP.fleet = seatP.fleet;
+    specP.orders = seatP.orders;
+    specP.eliminated = seatP.eliminated;
+    for (const ship of game.ships) {
+      if (ship.playerId === seat.id) ship.playerId = spectator.id;
+    }
+    for (const bomb of game.bombs) {
+      if (bomb.ownerPlayerId === seat.id) bomb.ownerPlayerId = spectator.id;
+    }
+    if (game.winnerId === seat.id) game.winnerId = spectator.id;
+    if (displacedName) {
+      seatP.name = displacedName;
+      seatP.isSpectator = true;
+      seatP.isBot = false;
+      seatP.connected = true;
+      seatP.eliminated = true;
+      seatP.fleet = null;
+      seatP.orders = null;
+      seatP.fleetReady = true;
+      seatP.ordersReady = true;
+      seatP.attacksReady = true;
+      seatP.color = { id: "gray", hex: "#9aa3b5", ink: "#fff", name: "Gray" };
+    }
+  }
+
+  reflectPromoted(room, spectator) {
+    if (!room.game) return;
+    const player = room.game.playerById(spectator.id);
+    if (!player) return;
+    player.name = spectator.name;
+    player.isSpectator = false;
+    player.isBot = false;
+    player.connected = true;
+    if (room.game.status !== "playing") {
+      player.eliminated = false;
+      player.fleetReady = false;
+    }
+  }
+
   again(socket) {
     const ctx = this.bySocket.get(socket.id);
     if (!ctx) return { error: "Join a room first." };

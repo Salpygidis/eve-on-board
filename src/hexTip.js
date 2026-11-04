@@ -7,7 +7,7 @@ export function describeHex(state, q, r) {
     const pilot = state.players?.find((p) => p.id === ship.playerId);
     const who = pilot ? `${pilot.name}'s ` : "";
     lines.push({
-      text: `${who}${ship.name} · shield ${ship.shield}/${ship.shieldMax} · hull ${ship.hullHp}/${ship.hullMax}`,
+      text: `${who}${ship.name} · shield ${ship.shield}/${ship.shieldMax} · armor ${ship.armor || 0}/${ship.armorMax || 0} · hull ${ship.hullHp}/${ship.hullMax}`,
     });
   }
   for (const bomb of state?.bombs || []) {

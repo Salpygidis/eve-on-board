@@ -1,26 +1,29 @@
-import { distance, key, neighbors } from "../shared/hex.js";
+import { DIRS, add, distance, key, neighbors } from "../shared/hex.js";
 import { CATALOG, PILOT_COLORS, SHIPS, colorById, sizeRank } from "../shared/catalog.js";
 import { suggestAttacks, suggestOrders } from "../shared/ai.js";
 import { uid } from "../shared/rng.js";
 import {
   applyCombatDamage,
+  applyHit,
   boardSet,
   buildArena,
   collisionOutcome,
   deploymentSlots,
   dirToward,
-  engagement,
+  freshOverdrive,
+  inWeaponRange,
   knockPath,
+  normalizeFit,
   nudgeFacing,
   planPath,
   shieldMaxFor,
-  shotDamage,
   starterFleet,
   statLine,
   travelLimit,
   validateFleet,
   validateOrders,
   weaponAt,
+  weaponShot,
 } from "../shared/rules.js";
 
 const LOG_CAP = 40;
@@ -36,12 +39,16 @@ export class Game {
     this.round = 1;
     this.serial = 1;
     this.hexes = arena.hexes;
+    this.foundations = arena.foundations;
     this.board = boardSet(arena.hexes);
     this.players = players;
     this.ships = [];
     this.bombs = [];
     this.log = ["Fit three ships. Lock the fleet when you are ready."];
     this.events = [];
+    this.activations = [];
+    this.activationIndex = 0;
+    this.activationShipId = null;
     this.winnerId = null;
     this.draw = false;
   }
@@ -94,7 +101,10 @@ export class Game {
     if (!player || player.isSpectator || this.status !== "playing") return false;
     if (this.phase === "fleet") return !player.fleetReady;
     if (this.phase === "orders") return !player.ordersReady && this.living(playerId).length > 0;
-    if (this.phase === "attack") return !player.attacksReady && this.attackers(playerId).length > 0;
+    if (this.phase === "attack") {
+      const ship = this.shipById(this.activationShipId);
+      return !!ship && ship.playerId === playerId;
+    }
     return false;
   }
 
@@ -104,7 +114,7 @@ export class Game {
     if (!player || player.isSpectator) return fail("Spectators do not bring a fleet.");
     const error = validateFleet(list);
     if (error) return fail(error);
-    player.fleet = list.map((s) => ({ hull: s.hull, modules: [...s.modules] }));
+    player.fleet = list.map((s) => normalizeFit(s));
     player.fleetReady = true;
     this.note(`${player.name} locked a fleet.`);
     if (this.players.filter((p) => !p.isSpectator).every((p) => p.fleetReady)) this.deploy();
@@ -113,12 +123,13 @@ export class Game {
 
   deploy() {
     const pilots = this.players.filter((p) => !p.isSpectator);
-    const slots = deploymentSlots(pilots.length, this.board);
+    const slots = deploymentSlots(pilots.length, this.board, this.foundations);
     this.ships = [];
     pilots.forEach((player, index) => {
       const spots = slots[index] || [];
       player.fleet.forEach((fit, n) => {
-        const def = SHIPS[fit.hull];
+        const fitted = normalizeFit(fit);
+        const def = SHIPS[fitted.hull];
         const spot = spots[n] || spots[0];
         const counts = {};
         const same = player.fleet.filter((s) => s.hull === fit.hull).length;
@@ -127,12 +138,15 @@ export class Game {
           id: `${player.id}:s${n}`,
           playerId: player.id,
           name: same > 1 ? `${def.name} ${counts[fit.hull]}` : def.name,
-          hull: fit.hull,
-          modules: [...fit.modules],
+          hull: fitted.hull,
+          modules: fitted.modules,
+          ammo: fitted.ammo,
           q: spot.q,
           r: spot.r,
           facing: spot.facing,
           shield: def.shield,
+          armor: def.armor,
+          armorMax: def.armor,
           hullHp: def.hull,
           hullMax: def.hull,
           energy: def.energy,
@@ -140,7 +154,7 @@ export class Game {
           spent: {},
           webbed: false,
           webNext: false,
-          odCooldown: false,
+          odCool: freshOverdrive(),
           cloaked: false,
           overcharge: false,
           removed: false,
@@ -152,6 +166,9 @@ export class Game {
           gyroUsed: false,
           useGyro: true,
           pending: null,
+          held: false,
+          pendingMove: null,
+          stealthOrder: null,
         };
         this.ships.push(ship);
       });
@@ -211,6 +228,9 @@ export class Game {
       ship.cloaked = false;
       ship.pending = null;
       ship.odWeapons = false;
+      ship.held = false;
+      ship.stealthOrder = null;
+      ship.anim = null;
     }
 
     for (const player of this.players) {
@@ -228,130 +248,226 @@ export class Game {
       for (const order of player.orders) {
         const ship = this.shipById(order.shipId);
         if (!ship || ship.removed || ship.hullHp <= 0) continue;
-        const start = starts.get(ship.id);
-        const focus = order.focusId ? starts.get(order.focusId) : null;
-        const color = colorById(order.color);
-        const stats = statLine(ship, this.ships);
-        if (order.card === "hold") {
-          ship.maneuver = "hold";
-          ship.transversal = "low";
-          ship.anim = [{ q: start.q, r: start.r }];
-          this.events.push({
-            type: "move",
-            shipId: ship.id,
-            ownerId: ship.playerId,
-            path: ship.anim,
-            facing: ship.facing,
-            color: null,
-            cloaked: ship.cloaked,
-            card: "hold",
-          });
+        if (ship.held) {
+          this.stay(ship, "hold", false);
           continue;
         }
-        const limit = travelLimit(stats.speed, {
-          overdrive: order.overdrive,
-          webbed: ship.webbed,
-          energy: ship.energy + (order.overdrive ? 1 : 0),
-          odCooldown: false,
-        });
-        const dist = Math.min(color?.dist || 0, limit);
-        const planned = planPath({
-          from: start,
-          facing: ship.facing,
-          card: order.card,
-          dist,
-          target: focus,
-          board: this.board,
-        });
-        ship.anim = planned.path.map((h) => ({ q: h.q, r: h.r }));
-        const end = planned.path[planned.path.length - 1];
-        ship.q = end.q;
-        ship.r = end.r;
-        ship.transversal = planned.transversal;
-        ship.maneuver = order.card;
-        this.events.push({
-          type: "move",
-          shipId: ship.id,
-          ownerId: ship.playerId,
-          path: ship.anim,
-          facing: ship.facing,
-          color: color?.id || null,
-          cloaked: ship.cloaked,
-          card: order.card,
-        });
+        if (ship.pendingMove) this.fly(ship, ship.pendingMove, true);
+        ship.pendingMove = null;
+        if (ship.stealthOrder) {
+          const plotted = ship.stealthOrder;
+          ship.stealthOrder = null;
+          ship.pendingMove = plotted;
+          ship.cloaked = true;
+          if (!ship.anim) this.stay(ship, plotted.card, true);
+          continue;
+        }
+        this.fly(ship, order, false);
       }
     }
 
+    this.clipCrossings();
     this.resolveCollisions(starts);
     this.applyGyro();
     this.resolveActives();
-    this.resolveBombs();
     this.applyGyro();
 
     for (const player of this.players) {
       player.orders = null;
       player.ordersReady = false;
+      player.attacksReady = false;
     }
+    this.beginAttack();
+  }
 
-    const anyone = this.players.some((p) => !p.isSpectator && this.attackers(p.id).length);
-    if (!anyone) {
-      this.note("No guns in range.");
-      this.openOrders();
-      return;
+  stay(ship, card, cloaked) {
+    ship.maneuver = card;
+    ship.transversal = "low";
+    ship.anim = [{ q: ship.q, r: ship.r }];
+    this.events.push({
+      type: "move",
+      shipId: ship.id,
+      ownerId: ship.playerId,
+      path: ship.anim.map((h) => ({ q: h.q, r: h.r })),
+      facing: ship.facing,
+      endFacing: ship.facing,
+      color: null,
+      cloaked,
+      card: cloaked ? "cloaked" : card,
+    });
+  }
+
+  fly(ship, order, stored) {
+    const stats = statLine(ship, this.ships);
+    const turn = Math.max(0, Math.min(stats.agility, Number(order.turn) || 0));
+    if (stored && turn > 0 && order.turnDir !== "none") {
+      const sign = order.turnDir === "right" ? -1 : 1;
+      ship.facing = (ship.facing + sign * turn + 60) % 6;
     }
-    for (const player of this.players) {
-      player.attacksReady = player.isSpectator || this.attackers(player.id).length === 0;
+    const color = colorById(order.color);
+    let dist = order.dist;
+    if (dist == null) {
+      const limit = travelLimit(stats.speed, {
+        overdrive: order.overdrive,
+        webbed: ship.webbed,
+        energy: ship.energy + (order.overdrive ? 1 : 0),
+        odCooldown: false,
+      });
+      dist = Math.min(color?.dist || 0, limit);
     }
-    this.note("Attack phase. Pick a weapon and a target.");
-    this.bump("attack");
+    const nose = ship.facing;
+    const planned = planPath({
+      from: { q: ship.q, r: ship.r },
+      facing: nose,
+      card: order.card,
+      color: color?.id || order.color,
+      dist,
+      board: this.board,
+    });
+    const steps = planned.path.map((h) => ({ q: h.q, r: h.r }));
+    ship.anim = ship.anim ? [...ship.anim, ...steps.slice(1)] : steps;
+    const end = steps[steps.length - 1];
+    ship.q = end.q;
+    ship.r = end.r;
+    ship.facing = planned.facing;
+    ship.transversal = planned.transversal;
+    ship.maneuver = order.card;
+    const existing = this.events.find((e) => e.type === "move" && e.shipId === ship.id);
+    if (existing) {
+      existing.path = ship.anim.map((h) => ({ q: h.q, r: h.r }));
+      existing.endFacing = ship.facing;
+      existing.card = order.card;
+      existing.cloaked = false;
+    } else {
+      this.events.push({
+        type: "move",
+        shipId: ship.id,
+        ownerId: ship.playerId,
+        path: ship.anim.map((h) => ({ q: h.q, r: h.r })),
+        facing: nose,
+        endFacing: ship.facing,
+        color: color?.id || order.color || null,
+        cloaked: false,
+        card: order.card,
+      });
+    }
+  }
+
+  clipCrossings() {
+    const movers = this.ships.filter((s) => s.anim && s.anim.length > 1 && !s.removed);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let i = 0; i < movers.length; i++) {
+        for (let j = i + 1; j < movers.length; j++) {
+          const hit = sharedStep(movers[i].anim, movers[j].anim);
+          if (!hit) continue;
+          if (movers[i].anim.length - 1 <= hit.a && movers[j].anim.length - 1 <= hit.b && key(movers[i].q, movers[i].r) === key(movers[j].q, movers[j].r)) continue;
+          movers[i].anim = movers[i].anim.slice(0, hit.a + 1);
+          movers[j].anim = movers[j].anim.slice(0, hit.b + 1);
+          const pile = { q: hit.hex.q, r: hit.hex.r };
+          movers[i].anim[movers[i].anim.length - 1] = pile;
+          movers[j].anim[movers[j].anim.length - 1] = { ...pile };
+          movers[i].q = pile.q;
+          movers[i].r = pile.r;
+          movers[j].q = pile.q;
+          movers[j].r = pile.r;
+          for (const ship of [movers[i], movers[j]]) {
+            const move = this.events.find((e) => e.type === "move" && e.shipId === ship.id);
+            if (move) move.path = ship.anim.map((h) => ({ q: h.q, r: h.r }));
+          }
+          changed = true;
+        }
+      }
+    }
+  }
+
+  beginAttack() {
+    const pilots = this.players.filter((p) => !p.isSpectator && !p.eliminated);
+    const lanes = pilots.map((p) => this.ships.filter((s) => s.playerId === p.id && this.canFire(s)));
+    this.activations = [];
+    const max = Math.max(0, ...lanes.map((lane) => lane.length));
+    for (let i = 0; i < max; i++) {
+      for (const lane of lanes) if (lane[i]) this.activations.push(lane[i].id);
+    }
+    this.activationIndex = 0;
+    this.advanceActivation();
+  }
+
+  advanceActivation() {
+    while (this.activationIndex < this.activations.length) {
+      const ship = this.shipById(this.activations[this.activationIndex]);
+      if (ship && this.canFire(ship) && this.legalTargets(ship).length) {
+        this.activationShipId = ship.id;
+        this.note(`${ship.name} may fire.`);
+        this.bump("attack");
+        return;
+      }
+      this.activationIndex += 1;
+    }
+    this.activationShipId = null;
+    this.openOrders();
   }
 
   applyOrderPrep(ship, order, stats) {
     ship.useGyro = order.useGyro !== false;
-    const turn = Math.max(0, Math.min(stats.agility, Number(order.turn) || 0));
     if (order.card === "hold") {
-      ship.energy = stats.energyMax;
-      ship.shield = Math.min(stats.shieldMax, ship.shield + 1);
-      ship.spent = {};
-      ship.odCooldown = false;
-      this.note(`${ship.name} holds. Energy full, shield patched, systems reset.`);
+      ship.held = true;
+      this.note(`${ship.name} holds and must survive the shooting.`);
+      return;
     }
+    const turn = Math.max(0, Math.min(stats.agility, Number(order.turn) || 0));
+    if (!ship.odCool) ship.odCool = freshOverdrive();
     if (order.overdrive) {
       ship.energy = Math.max(0, ship.energy - 1);
       ship.odWeapons = order.overdrive === "weapons";
+      ship.odCool[order.overdrive] = true;
       if (order.overdrive === "shield") {
         ship.shield = Math.min(stats.shieldMax, ship.shield + 1);
         this.note(`${ship.name} overdrives shields.`);
       }
-      if (order.card !== "hold") ship.odCooldown = true;
-    }
-    if (turn > 0) {
-      const sign = order.turnDir === "right" ? 1 : -1;
-      ship.facing = (ship.facing + sign * turn + 60) % 6;
+      if (ship.odWeapons && ship.modules.includes("overcharge")) ship.overcharge = true;
     }
     if (order.active?.id === "stealth") {
+      const color = colorById(order.color);
+      const limit = travelLimit(stats.speed, {
+        overdrive: order.overdrive,
+        webbed: ship.webbed,
+        energy: ship.energy + (order.overdrive ? 1 : 0),
+        odCooldown: false,
+      });
+      ship.stealthOrder = {
+        card: order.card,
+        color: order.color,
+        turn,
+        turnDir: order.turnDir,
+        dist: Math.min(color?.dist || 0, limit),
+      };
       ship.cloaked = true;
       ship.spent = { ...ship.spent, stealth: true };
       this.note(`${ship.name} drops off the scope.`);
+      return;
+    }
+    if (turn > 0 && order.turnDir !== "none") {
+      const sign = order.turnDir === "right" ? -1 : 1;
+      ship.facing = (ship.facing + sign * turn + 60) % 6;
     }
     if (order.active?.id === "bomb") {
-      const start = { q: ship.q, r: ship.r };
-      this.bombs.push({
-        id: uid("bomb"),
-        ownerShipId: ship.id,
-        ownerPlayerId: ship.playerId,
-        ownerName: ship.name,
-        q: start.q,
-        r: start.r,
-        placedRound: this.round,
-        damage: SHIPS[ship.hull].damage,
-      });
-      ship.spent = { ...ship.spent, bomb: true };
-      this.note(`${ship.name} drops a smart bomb.`);
-    }
-    if (order.active?.id === "overcharge") {
-      ship.overcharge = true;
-      ship.spent = { ...ship.spent, overcharge: true };
+      const back = (ship.facing + 3) % 6;
+      const hex = add(ship, DIRS[back]);
+      if (this.board.has(key(hex.q, hex.r))) {
+        this.bombs.push({
+          id: uid("bomb"),
+          ownerShipId: ship.id,
+          ownerPlayerId: ship.playerId,
+          ownerName: ship.name,
+          q: hex.q,
+          r: hex.r,
+          placedRound: this.round,
+        });
+        ship.spent = { ...ship.spent, bomb: true };
+        this.note(`${ship.name} drops a smart bomb behind the ship.`);
+      }
     }
     if (order.active && (order.active.id === "neut" || order.active.id === "web")) {
       ship.pending = { id: order.active.id, targetId: order.active.targetId };
@@ -489,36 +605,27 @@ export class Game {
     }
   }
 
-  resolveBombs() {
-    const left = [];
+  explodeBombs() {
     for (const bomb of this.bombs) {
-      const present = this.ships.filter((s) => !s.removed && s.q === bomb.q && s.r === bomb.r);
-      const strangers = present.filter((s) => !(bomb.placedRound === this.round && s.id === bomb.ownerShipId));
-      const triggers = bomb.placedRound === this.round ? strangers.length > 0 : present.length > 0;
-      if (!triggers) {
-        left.push(bomb);
-        continue;
-      }
       const hits = [];
-      for (const ship of present) {
-        if (bomb.placedRound === this.round && ship.id === bomb.ownerShipId) continue;
-        const hit = applyCombatDamage(ship, bomb.damage, { hullOnly: false });
-        hits.push({ shipId: ship.id, damage: hit.dealt, shield: hit.shield, hull: hit.hull });
-        if (ship.hullHp <= 0) ship.pendingBombDeath = true;
+      for (const ship of this.ships) {
+        if (ship.removed || ship.hullHp <= 0) continue;
+        const dist = distance(ship, bomb);
+        const amount = dist <= 1 ? 5 : dist === 2 ? 2 : 0;
+        if (!amount) continue;
+        const hit = applyHit(ship, amount, { ammo: "explosive" });
+        hits.push({ shipId: ship.id, damage: hit.dealt, shield: hit.shield, armor: hit.armor, hull: hit.hull });
+        if (hit.knock && ship.hullHp > 0) this.shove(ship, dirToward(bomb, ship), hit.knock);
         this.note(`${bomb.ownerName}'s smart bomb hits ${ship.name} for ${hit.dealt}.`);
       }
       this.events.push({ type: "bomb", q: bomb.q, r: bomb.r, hits });
     }
-    this.bombs = left;
-  }
-
-  attackers(playerId) {
-    return this.ships.filter((s) => s.playerId === playerId && this.canFire(s) && this.legalTargets(s).length);
+    this.bombs = [];
   }
 
   canFire(ship) {
-    if (!ship || ship.removed || ship.collisionKilled) return false;
-    if (ship.hullHp <= 0 && !ship.pendingBombDeath) return false;
+    if (!ship || ship.removed || ship.collisionKilled || ship.held) return false;
+    if (ship.hullHp <= 0) return false;
     return ship.modules.some((id) => CATALOG[id]?.slot === "weapon");
   }
 
@@ -531,7 +638,7 @@ export class Game {
       const weapons = [];
       ship.modules.forEach((id, index) => {
         const weapon = weaponAt(ship, index);
-        if (weapon && dist <= weapon.optimal + weapon.falloff) weapons.push(index);
+        if (weapon && inWeaponRange(weapon, dist)) weapons.push(index);
       });
       if (weapons.length) out.push({ id: other.id, dist, weapons });
     }
@@ -542,74 +649,69 @@ export class Game {
     if (this.phase !== "attack") return fail("Not the attack phase.");
     const player = this.playerById(playerId);
     if (!player || player.isSpectator) return fail("You are not flying.");
-    if (player.attacksReady) return fail("Volley already locked.");
-    const required = this.attackers(playerId);
-    const list = Array.isArray(attacks) ? attacks : [];
-    if (list.length !== required.length) return fail("Assign every ship that can fire.");
-    const seen = new Set();
-    for (const attack of list) {
-      const ship = required.find((s) => s.id === attack?.shipId);
-      if (!ship || seen.has(ship.id)) return fail("Unknown firing ship.");
-      seen.add(ship.id);
-      const legal = this.legalTargets(ship);
-      const weapon = weaponAt(ship, attack.weaponIndex);
-      const target = legal.find((t) => t.id === attack.targetId);
-      if (!weapon || !target || !target.weapons.includes(attack.weaponIndex)) {
-        return fail(`${ship.name} cannot fire that shot.`);
-      }
-      if (attack.followIndex != null) {
-        if (!ship.modules.includes("rapid")) return fail("Rapid Weapons is not fitted.");
-        const follow = weaponAt(ship, attack.followIndex);
-        const followTarget = legal.find((t) => t.id === (attack.followTargetId || attack.targetId));
-        if (!follow || attack.followIndex === attack.weaponIndex || !followTarget?.weapons.includes(attack.followIndex)) {
-          return fail("The follow-up shot is illegal.");
-        }
+    const ship = this.shipById(this.activationShipId);
+    if (!ship || ship.playerId !== playerId) return fail("Not your activation.");
+    const attack = Array.isArray(attacks) ? attacks.find((a) => a?.shipId === ship.id) || attacks[0] : attacks;
+    if (!attack || attack.pass) {
+      this.note(`${ship.name} holds fire.`);
+      this.activationIndex += 1;
+      this.advanceActivation();
+      return { ok: true };
+    }
+    const legal = this.legalTargets(ship);
+    const weapon = weaponAt(ship, attack.weaponIndex);
+    const target = legal.find((t) => t.id === attack.targetId);
+    if (!weapon || !target || !target.weapons.includes(attack.weaponIndex)) {
+      return fail(`${ship.name} cannot fire that shot.`);
+    }
+    const first = this.resolveShot(ship, attack.weaponIndex, attack.targetId, false);
+    if (attack.followIndex != null && ship.modules.includes("rapid") && first?.quality === "red") {
+      const followTarget = this.legalTargets(ship).find((t) => t.id === (attack.followTargetId || attack.targetId));
+      if (followTarget?.weapons.includes(attack.followIndex) && attack.followIndex !== attack.weaponIndex) {
+        this.resolveShot(ship, attack.followIndex, followTarget.id, true);
       }
     }
-    player.attacks = list.map((a) => ({ ...a }));
-    player.attacksReady = true;
-    if (this.players.filter((p) => !p.isSpectator).every((p) => p.attacksReady)) this.resolveAttacks();
+    this.activationIndex += 1;
+    this.advanceActivation();
     return { ok: true };
   }
 
-  resolveAttacks() {
-    const volleys = [];
-    for (const player of this.players) {
-      for (const attack of player.attacks || []) volleys.push(attack);
-      player.attacks = null;
-    }
-    volleys.sort((a, b) => String(a.shipId).localeCompare(String(b.shipId)));
-    const shots = [];
-    for (const attack of volleys) {
-      const ship = this.shipById(attack.shipId);
-      if (!this.canFire(ship)) continue;
-      const first = this.previewShot(ship, attack.weaponIndex, attack.targetId, false);
-      if (first) shots.push(first);
-      if (attack.followIndex == null || !ship.modules.includes("rapid") || first?.quality !== "red") continue;
-      const second = this.previewShot(ship, attack.followIndex, attack.followTargetId || attack.targetId, true);
-      if (second) shots.push(second);
-    }
-    for (const shot of shots) {
-      const target = this.shipById(shot.targetId);
-      const applied = shot.damage && target ? applyCombatDamage(target, shot.damage) : { dealt: 0, shield: 0, hull: 0 };
-      if (target && target.hullHp <= 0) target.pendingBombDeath = true;
-      this.events.push({ ...shot, damage: applied.dealt });
-      const word = shot.quality === "miss" ? "misses" : `hits ${shot.quality} for ${applied.dealt}`;
-      this.note(`${shot.shipName} ${shot.weapon} ${word} ${shot.targetName}.`);
-    }
-    this.openOrders();
+  resolveShot(ship, weaponIndex, targetId, follow) {
+    const shot = this.previewShot(ship, weaponIndex, targetId, follow);
+    if (!shot) return null;
+    const target = this.shipById(targetId);
+    const applied = shot.quality === "miss" || !target
+      ? { dealt: 0, knock: 0 }
+      : applyHit(target, shot.damage, { ammo: shot.ammo });
+    this.events.push({ ...shot, damage: applied.dealt, knock: applied.knock });
+    const word = shot.quality === "miss" ? "misses" : `hits ${shot.quality} for ${applied.dealt}`;
+    this.note(`${shot.shipName} ${shot.weapon} ${word} ${shot.targetName}.`);
+    if (applied.knock && target && target.hullHp > 0) this.shove(target, dirToward(ship, target), applied.knock);
+    this.applyGyro();
+    return { ...shot, damage: applied.dealt };
+  }
+
+  shove(target, dir, steps) {
+    const reserved = new Set(
+      this.ships.filter((s) => !s.removed && s.hullHp > 0 && s.id !== target.id).map((s) => key(s.q, s.r))
+    );
+    const extra = knockPath(target, dir, steps, this.board, reserved);
+    if (!extra.length) return;
+    const end = extra[extra.length - 1];
+    target.q = end.q;
+    target.r = end.r;
+    this.events.push({ type: "knock", shipId: target.id, q: end.q, r: end.r });
+    this.note(`${target.name} is knocked back.`);
   }
 
   previewShot(ship, weaponIndex, targetId, follow) {
     const weapon = weaponAt(ship, weaponIndex);
     const target = this.shipById(targetId);
-    if (!weapon || !target || target.removed || target.cloaked) return null;
-    if (target.hullHp <= 0 && !target.pendingBombDeath) return null;
+    if (!weapon || !target || target.removed || target.cloaked || target.hullHp <= 0) return null;
     const dist = distance(ship, target);
-    const band = engagement(dist, weapon, target.transversal || "low");
-    const shot = shotDamage(SHIPS[ship.hull].damage, band, {
+    const shot = weaponShot(weapon, dist, {
       overdrive: !!ship.odWeapons,
-      overcharge: ship.overcharge,
+      overcharge: !!ship.overcharge,
     });
     return {
       type: "attack",
@@ -619,15 +721,20 @@ export class Game {
       targetName: target.name,
       quality: shot.quality,
       damage: shot.damage,
+      knock: 0,
+      ammo: weapon.ammo,
       weapon: weapon.name,
       follow,
     };
   }
 
   openOrders() {
+    this.explodeBombs();
+    this.applyGyro();
     for (const ship of this.ships) {
       if (ship.hullHp <= 0) {
         ship.removed = true;
+        ship.held = false;
         if (!ship.collisionKilled) {
           this.note(`${ship.name} breaks apart.`);
           this.events.push({ type: "wreck", shipId: ship.id, reason: "hull" });
@@ -635,7 +742,18 @@ export class Game {
       }
     }
     for (const ship of this.ships) {
+      if (ship.removed || !ship.held) continue;
+      const stats = statLine(ship, this.ships);
+      ship.energy = stats.energyMax;
+      ship.shield = Math.min(stats.shieldMax, ship.shield + 1);
+      if (ship.modules.includes("repair")) ship.armor = Math.min(ship.armorMax, (ship.armor || 0) + 1);
+      ship.spent = {};
+      ship.odCool = freshOverdrive();
+      this.note(`${ship.name} recovers. Energy full, shield patched, systems reset.`);
+    }
+    for (const ship of this.ships) {
       if (ship.removed) continue;
+      ship.held = false;
       ship.shieldMax = shieldMaxFor(ship, this.ships);
       ship.shield = Math.min(ship.shield, ship.shieldMax);
       ship.webbed = !!ship.webNext;
@@ -675,16 +793,7 @@ export class Game {
       if (error) return this.submitOrders(playerId, holdAll(this.living(playerId)));
       return this.submitOrders(playerId, orders);
     }
-    if (this.phase === "attack") {
-      const suggested = suggestAttacks(this, playerId);
-      const result = this.submitAttacks(playerId, suggested);
-      if (result.ok) return result;
-      const fallback = this.attackers(playerId).map((ship) => {
-        const legal = this.legalTargets(ship)[0];
-        return { shipId: ship.id, weaponIndex: legal.weapons[0], targetId: legal.id };
-      });
-      return this.submitAttacks(playerId, fallback);
-    }
+    if (this.phase === "attack") return this.submitAttacks(playerId, suggestAttacks(this, playerId));
     return { ok: true };
   }
 
@@ -708,6 +817,7 @@ export class Game {
       winnerId: this.winnerId,
       draw: this.draw,
       hexes: this.hexes,
+      foundations: this.foundations,
       bombs: this.bombs.map((b) => ({
         id: b.id,
         q: b.q,
@@ -734,8 +844,15 @@ export class Game {
         attacksReady: p.attacksReady,
       })),
       ships: this.ships.filter((s) => !s.removed).map((s) => this.shipJSON(s, viewerId)),
-      targets: this.phase === "attack" && viewer && !viewer.isSpectator
-        ? Object.fromEntries(this.attackers(viewerId).map((s) => [s.id, this.legalTargets(s)]))
+      activation: this.phase === "attack" && this.activationShipId
+        ? {
+            shipId: this.activationShipId,
+            playerId: this.shipById(this.activationShipId)?.playerId || null,
+            name: this.shipById(this.activationShipId)?.name || "",
+          }
+        : null,
+      targets: this.phase === "attack" && viewer && !viewer.isSpectator && this.shipById(this.activationShipId)?.playerId === viewerId
+        ? { [this.activationShipId]: this.legalTargets(this.shipById(this.activationShipId)) }
         : {},
     };
   }
@@ -751,11 +868,14 @@ export class Game {
       hullName: SHIPS[ship.hull].name,
       size: SHIPS[ship.hull].size,
       modules: ship.modules,
+      ammo: ship.ammo || [],
       q: ship.q,
       r: ship.r,
       facing: ship.facing,
       shield: ship.shield,
       shieldMax: stats.shieldMax,
+      armor: ship.armor || 0,
+      armorMax: ship.armorMax || 0,
       hullHp: ship.hullHp,
       hullMax: ship.hullMax,
       energy: ship.energy,
@@ -764,7 +884,7 @@ export class Game {
       agility: stats.agility,
       damage: stats.damage,
       webbed: ship.webbed,
-      odCooldown: ship.odCooldown,
+      odCool: ship.odCool || freshOverdrive(),
       cloaked: hide,
       webIncoming: ship.webNext,
       transversal: hide ? null : ship.transversal,
@@ -774,6 +894,19 @@ export class Game {
       pendingBombDeath: ship.pendingBombDeath,
     };
   }
+}
+
+function sharedStep(pathA, pathB) {
+  const limit = Math.min(pathA.length, pathB.length);
+  for (let i = 1; i < limit; i++) {
+    const a = key(pathA[i].q, pathA[i].r);
+    const b = key(pathB[i].q, pathB[i].r);
+    if (a === b) return { a: i, b: i, hex: pathA[i] };
+    const prevA = key(pathA[i - 1].q, pathA[i - 1].r);
+    const prevB = key(pathB[i - 1].q, pathB[i - 1].r);
+    if (a === prevB && b === prevA) return { a: i, b: i, hex: pathA[i] };
+  }
+  return null;
 }
 
 function fail(error) {

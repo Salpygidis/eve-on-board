@@ -39,6 +39,13 @@ export function attachSockets(io, rooms) {
       rooms.broadcast(result.room);
     });
 
+    socket.on("room:seat", (payload = {}, cb) => {
+      const result = rooms.takeSeat(socket, payload);
+      if (result.error) return ack(cb, { error: result.error });
+      ack(cb, joinedPayload(result.room, result.player));
+      rooms.broadcast(result.room);
+    });
+
     socket.on("room:again", (_payload, cb) => {
       const result = rooms.again(socket);
       if (result.error) return ack(cb, { error: result.error });
