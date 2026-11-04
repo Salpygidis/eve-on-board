@@ -1,9 +1,12 @@
 /** Legal default orders for bots and the suggestion button. */
 
 import { distance, key } from "./hex.js";
-import { CATALOG, MANEUVERS, colorById } from "./catalog.js";
+import { CATALOG, COLORS, MANEUVERS, colorById } from "./catalog.js";
 import {
   boardSet,
+  bandAt,
+  cardReach,
+  isCooling,
   planPath,
   statLine,
   travelLimit,
@@ -25,37 +28,29 @@ function nearestEnemy(ship, ships) {
   return best ? { ship: best, dist: bestD } : null;
 }
 
-function bestColor(stats, ship, want) {
+function bestColor(stats, ship, card, wantHexes) {
+  const cooling = isCooling(ship, "movement");
   const limit = travelLimit(stats.speed, {
     overdrive: "movement",
     webbed: ship.webbed,
     energy: ship.energy,
-    odCooldown: ship.odCooldown,
+    odCooldown: cooling,
   });
   const plain = travelLimit(stats.speed, {
     webbed: ship.webbed,
     energy: ship.energy,
-    odCooldown: ship.odCooldown,
+    odCooldown: cooling,
   });
-  let choice = null;
-  let drive = false;
-  for (const color of [
-    { id: "lb", dist: 1 },
-    { id: "lg", dist: 2 },
-    { id: "y", dist: 3 },
-    { id: "r", dist: 4 },
-  ]) {
-    if (color.dist > want) continue;
-    if (color.dist <= plain) {
-      choice = color.id;
-      drive = false;
-    } else if (color.dist <= limit) {
-      choice = color.id;
-      drive = true;
-    }
-  }
-  if (!choice) return { color: "lb", movement: false, dist: Math.min(plain, 1) };
-  return { color: choice, movement: drive, dist: drive ? limit : plain };
+  const legal = COLORS.filter((color) => color.dist <= limit).map((color) => ({
+    id: color.id,
+    hexes: cardReach(card, color.id),
+    movement: color.dist > plain,
+  }));
+  if (!legal.length) return { color: "lb", movement: false, hexes: 0 };
+  const under = legal.filter((color) => color.hexes <= wantHexes);
+  const pool = under.length ? under : legal;
+  pool.sort((a, b) => (under.length ? b.hexes - a.hexes : a.hexes - b.hexes));
+  return pool[0];
 }
 
 function take(used, card) {
@@ -73,8 +68,8 @@ export function suggestOrders(game, playerId) {
     const weapons = ship.modules
       .map((id, index) => weaponAt(ship, index))
       .filter(Boolean);
-    const optimal = weapons.reduce((m, w) => Math.max(m, w.optimal), 1);
-    const reach = weapons.reduce((m, w) => Math.max(m, w.optimal + w.falloff), 0);
+    const optimal = weapons.reduce((m, w) => Math.max(m, bestRange(w)), 1);
+    const reach = weapons.reduce((m, w) => Math.max(m, maxRange(w)), 0);
     let desired = "approach";
     let want = foe ? Math.max(1, foe.dist - Math.max(1, optimal)) : 1;
     if (!foe) {
@@ -105,28 +100,26 @@ export function suggestOrders(game, playerId) {
       holdSpend = MANEUVERS.find((id) => (used[id] || 0) < 2) || "approach";
       used[holdSpend] = (used[holdSpend] || 0) + 1;
     }
-    const picked = card === "hold" ? { color: "lb", movement: false } : bestColor(stats, ship, Math.max(want, 1));
-    if (card !== "hold" && picked.dist <= 0) {
+    const picked = card === "hold" ? { color: "lb", movement: false, hexes: 0 } : bestColor(stats, ship, card, Math.max(want, 1));
+    if (card !== "hold" && picked.hexes <= 0) {
       holdSpend = card;
       card = "hold";
     }
     let overdrive = null;
-    const canDrive = !ship.odCooldown && ship.energy >= 1 && !ship.webbed;
+    const canDrive = !isCooling(ship, "movement") && ship.energy >= 1 && !ship.webbed;
     if (card !== "hold" && picked.movement && canDrive) overdrive = "movement";
-    else if (!ship.odCooldown && ship.energy >= 1 && foe && foe.dist <= reach) overdrive = "weapons";
-    else if (!ship.odCooldown && ship.energy >= 1 && ship.shield < stats.shieldMax) overdrive = "shield";
+    else if (card !== "hold" && !isCooling(ship, "weapons") && ship.energy >= 1 && foe && foe.dist <= reach) overdrive = "weapons";
+    else if (card !== "hold" && !isCooling(ship, "shield") && ship.energy >= 1 && ship.shield < stats.shieldMax) overdrive = "shield";
 
     let active = null;
     const spent = ship.spent || {};
-    if (foe && ship.modules.includes("web") && !spent.web && foe.dist <= 5 && !foe.webbed && !foe.webNext) {
+    if (card !== "hold" && foe && ship.modules.includes("web") && !spent.web && foe.dist <= 5 && !foe.webbed && !foe.webNext) {
       active = { id: "web", targetId: foe.ship.id };
-    } else if (foe && ship.modules.includes("neut") && !spent.neut && foe.dist <= 5 && foe.energy > 0) {
+    } else if (card !== "hold" && foe && ship.modules.includes("neut") && !spent.neut && foe.dist <= 5 && foe.energy > 0) {
       active = { id: "neut", targetId: foe.ship.id };
-    } else if (ship.modules.includes("overcharge") && !spent.overcharge && overdrive === "weapons") {
-      active = { id: "overcharge" };
-    } else if (foe && ship.modules.includes("bomb") && !spent.bomb && foe.dist <= 2) {
+    } else if (card !== "hold" && foe && ship.modules.includes("bomb") && !spent.bomb && foe.dist <= 2) {
       active = { id: "bomb" };
-    } else if (ship.modules.includes("stealth") && !spent.stealth && ship.hullHp <= Math.ceil(ship.hullMax / 2)) {
+    } else if (card !== "hold" && ship.modules.includes("stealth") && !spent.stealth && ship.hullHp <= Math.ceil(ship.hullMax / 2)) {
       active = { id: "stealth" };
     }
 
@@ -134,14 +127,14 @@ export function suggestOrders(game, playerId) {
     let turnDir = "none";
     if (foe && stats.agility > 0) {
       const desiredDir = dirToward(ship, foe.ship);
-      const cw = (desiredDir - ship.facing + 6) % 6;
-      const ccw = (ship.facing - desiredDir + 6) % 6;
+      const left = (desiredDir - ship.facing + 6) % 6;
+      const right = (ship.facing - desiredDir + 6) % 6;
       if (desiredDir !== ship.facing) {
-        if (cw <= ccw) {
-          turn = Math.min(stats.agility, cw);
+        if (right <= left) {
+          turn = Math.min(stats.agility, right);
           turnDir = "right";
         } else {
-          turn = Math.min(stats.agility, ccw);
+          turn = Math.min(stats.agility, left);
           turnDir = "left";
         }
       }
@@ -153,7 +146,7 @@ export function suggestOrders(game, playerId) {
       turnDir,
       card,
       holdSpend,
-      color: picked.color,
+      color: picked.color || picked.id || "lb",
       overdrive,
       active,
       focusId: foe?.ship.id || null,
@@ -162,39 +155,57 @@ export function suggestOrders(game, playerId) {
   });
 }
 
-export function suggestAttacks(game, playerId) {
-  const ships = (game.ships || []).filter((s) => s.playerId === playerId && !s.removed && !s.collisionKilled);
-  const attacks = [];
-  for (const ship of ships) {
-    if (ship.hullHp <= 0 && !ship.pendingBombDeath) continue;
-    const options = [];
-    ship.modules.forEach((id, index) => {
-      const weapon = weaponAt(ship, index);
-      if (!weapon) return;
-      for (const other of game.ships) {
-        if (other.playerId === ship.playerId || other.removed || other.collisionKilled || other.hullHp <= 0) continue;
-        if (other.cloaked) continue;
-        const dist = distance(ship, other);
-        if (dist > weapon.optimal + weapon.falloff) continue;
-        const trans = other.transversal || "low";
-        const quality = dist <= weapon.optimal ? (trans === "high" ? 1 : 2) : trans === "low" ? 1 : 0;
-        options.push({ index, targetId: other.id, quality, dist });
-      }
-    });
-    options.sort((a, b) => b.quality - a.quality || a.dist - b.dist);
-    if (!options.length) continue;
-    const first = options[0];
-    const attack = { shipId: ship.id, weaponIndex: first.index, targetId: first.targetId };
-    if (ship.modules.includes("rapid")) {
-      const second = options.find((o) => o.index !== first.index);
-      if (second) {
-        attack.followIndex = second.index;
-        attack.followTargetId = second.targetId;
-      }
+function maxRange(weapon) {
+  if (!weapon?.bands) return 0;
+  let max = 0;
+  weapon.bands.forEach((band, index) => {
+    if (band) max = index;
+  });
+  return max;
+}
+
+function bestRange(weapon) {
+  if (!weapon?.bands) return 1;
+  let best = 1;
+  let damage = -1;
+  weapon.bands.forEach((band, index) => {
+    if (band && band[1] > damage) {
+      damage = band[1];
+      best = index;
     }
-    attacks.push(attack);
+  });
+  return best;
+}
+
+export function suggestAttacks(game, playerId) {
+  const shipId = game.activationShipId || game.activation?.shipId;
+  const ship = (game.ships || []).find((s) => s.id === shipId && s.playerId === playerId);
+  if (!ship) return { pass: true, shipId };
+  const options = [];
+  ship.modules.forEach((id, index) => {
+    const weapon = weaponAt(ship, index);
+    if (!weapon) return;
+    for (const other of game.ships) {
+      if (other.playerId === ship.playerId || other.removed || other.collisionKilled || other.hullHp <= 0) continue;
+      if (other.cloaked) continue;
+      const dist = distance(ship, other);
+      const band = bandAt(weapon, dist);
+      if (!band) continue;
+      options.push({ index, targetId: other.id, quality: band[0] === "red" ? 2 : 1, damage: band[1], dist });
+    }
+  });
+  options.sort((a, b) => b.quality - a.quality || b.damage - a.damage || a.dist - b.dist);
+  if (!options.length) return { pass: true, shipId: ship.id };
+  const first = options[0];
+  const attack = { shipId: ship.id, weaponIndex: first.index, targetId: first.targetId };
+  if (ship.modules.includes("rapid") && first.quality === 2) {
+    const second = options.find((o) => o.index !== first.index);
+    if (second) {
+      attack.followIndex = second.index;
+      attack.followTargetId = second.targetId;
+    }
   }
-  return attacks;
+  return attack;
 }
 
 export function arenaKeys(game) {
@@ -206,19 +217,18 @@ export function previewPath(game, ship, order) {
   const stats = statLine(ship, game.ships);
   const color = colorById(order.color);
   const facing = facingAfter(ship.facing, order, stats.agility);
-  const target = (game.ships || []).find((s) => s.id === order.focusId) || null;
   const dist = order.card === "hold" ? 0 : Math.min(color?.dist || 0, travelLimit(stats.speed, {
     overdrive: order.overdrive,
     webbed: ship.webbed,
-    energy: ship.energy,
-    odCooldown: ship.odCooldown,
+    energy: order.card === "hold" ? stats.energyMax : ship.energy,
+    odCooldown: order.card === "hold" ? false : isCooling(ship, "movement"),
   }));
   return planPath({
     from: ship,
     facing,
     card: order.card,
+    color: order.color,
     dist,
-    target,
     board,
   });
 }
@@ -226,7 +236,7 @@ export function previewPath(game, ship, order) {
 export function facingAfter(facing, order, agility) {
   const turn = Math.max(0, Math.min(agility, Number(order.turn) || 0));
   if (!turn || order.turnDir === "none") return ((facing % 6) + 6) % 6;
-  const sign = order.turnDir === "right" ? 1 : -1;
+  const sign = order.turnDir === "right" ? -1 : 1;
   return (facing + sign * turn + 60) % 6;
 }
 

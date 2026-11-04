@@ -18,38 +18,29 @@ Room state lives in the Node process. If the server restarts or sleeps, open roo
 
 Each pilot fields exactly three ships: any mix of Rifter (small), Rupture (medium), and Tempest (large). Modules spend racks. A dash in the fitting list means that hull cannot mount it.
 
-A round is simultaneous:
+A round:
 
 1. Secret orders for every living ship.
-2. Reveal.
-3. Movement and collisions.
-4. Smart bombs.
-5. Attacks.
-6. Cleanup.
+2. Everyone moves at once. Collisions resolve as paths cross.
+3. Ships alternate one weapon at a time.
+4. Smart bombs explode.
+5. Ships at 0 hull are removed, then Hold recovers whoever is left.
 
 Orders, per ship:
 
-- **Turn** — up to Agility faces of 60°, shown as stacked tokens.
-- **Maneuver** — Approach, Orbit Left, Orbit Right, Keep at Range, Strafe Left, Strafe Right, or Hold. You have two of each card. Hold is any card placed face-down.
-- **Color** — Light Blue 1, Light Green 2, Yellow 3, Red 4. Speed is the furthest color without Overdrive. Red is the Overdrive Movement step past Yellow.
-- **Overdrive** — optional, costs 1 energy, one per ship until that ship Holds. Movement +1 color, Weapons +2 damage, Shield +1 shield.
-- One optional active module.
+- **Turn** — up to Agility faces of 60°, shown as stacked tokens, before the move.
+- **Maneuver** — a card from a deck of two each: Approach, Orbit Left, Orbit Right, Keep at Range, Strafe Left, Strafe Right. Hold is any one of those cards placed face-down, and it skips the whole turn.
+- **Color** — how far along the printed card you travel. Speed 1 reaches blue, 2 green, 3 yellow. Speed 4 or Overdrive Movement reaches red. Approach is 3 / 4 / 5 / 6 hexes. Strafe and Keep at Range are 2 / 3 / 4 / 5. Orbit is 3 / 5 / 7 / 8.
+- **Overdrive** — optional, one per ship, costs 1 energy. Speed, Shields, and Damage each cool on their own until a Hold resolves. Movement adds a color, Weapons adds 1 damage, Shield restores 1. Weapon Overcharge makes yellow bands hit as red while Weapons is overdriven.
+- Modules that say they are played in the hidden phase, such as Smart Bomb and Stealth.
 
-Hold refills energy, restores 1 shield, and resets spent modules and Overdrive.
+Hold does nothing until the end of the round. If the ship still has hull, it refills energy, gains 1 shield, resets modules and Overdrive, and Auxiliary Armor Repairer also restores 1 armor.
 
-Approach and Keep at Range are low transversal. Orbit and Strafe are high. Inside optimal with low transversal is a red hit (full ship damage). Other shots still in range are yellow (damage − 1) or a miss. Past falloff is a miss. Weapons fire in any direction.
+Each weapon has a printed range diagram and one ammo token chosen for the match. Gray range is no shot. If the first point of a hit lands on armor, that hit is reduced by 1. An ammo bonus applies only when the first point lands on that ammo's layer: Kinetic armor, Thermal hull, EM shield, Explosive knockback on hull.
 
-| Weapon | Optimal | Falloff | Type |
-| --- | --- | --- | --- |
-| Blasters | 1 | 1 | Thermal |
-| Autocannons | 2 | 2 | Kinetic |
-| Rails | 4 | 2 | Kinetic |
-| Artillery | 5 | 1 | Explosive |
-| Rockets | 3 | 3 | Explosive |
+A smart bomb is placed on the hex behind the ship during orders and explodes at the end of the attack phase. The bomb hex and its neighbors take 5. The ring beyond takes 2.
 
-A smart bomb mines the hex you occupy when you drop it. After movement, it detonates if another ship is on that hex. You do not set off your own bomb on the turn you drop it. It stays until it blows, then hits everyone in the hex except you on the drop turn.
-
-Collisions happen when two ships finish on the same hex or trade places. Both take 1 hull. The smaller ship takes 1 more hull per size step. Shields do not absorb it. Knockback equals hull lost, then each ship may twist one face. A ship destroyed by the collision does not fire. A ship destroyed any other way still shoots that phase.
+Collisions happen when two ships cross or finish on the same hex. Both take 1 hull. The smaller ship takes 1 more hull per size step. Shields do not absorb it. A ship destroyed by the collision does not fire.
 
 Last fleet with a ship left wins.
 

@@ -7,13 +7,14 @@ import {
   faceStep,
   key,
   neighbors,
-  ring,
+  parseKey,
 } from "./hex.js";
+import { PLATE_ORIGINS, foundationBoard } from "./plates.js";
 import {
+  AMMO,
   CARD_COPIES,
   CATALOG,
   COLORS,
-  KEEP_RANGE,
   MANEUVERS,
   SHIPS,
   colorById,
@@ -22,15 +23,9 @@ import {
 
 export const ARENA_RADIUS = 4;
 
-export function buildArena(radius = ARENA_RADIUS) {
-  const hexes = ring(radius).map((h) => {
-    const d = distance(h, { q: 0, r: 0 });
-    let tint = "#152238";
-    if (d === 0) tint = "#2a4170";
-    else if ((d + h.q + h.r) % 2 === 0) tint = "#1b2c4d";
-    return { q: h.q, r: h.r, terrain: "void", elevation: 0, tint };
-  });
-  return { radius, hexes };
+export function buildArena() {
+  const board = foundationBoard();
+  return { radius: ARENA_RADIUS, ...board };
 }
 
 export function boardSet(hexes) {
@@ -39,10 +34,21 @@ export function boardSet(hexes) {
 
 export function starterFleet() {
   return [
-    { hull: "rifter", modules: ["blasters", "nano"] },
-    { hull: "rupture", modules: ["autocannons", "web", "dampener"] },
-    { hull: "tempest", modules: ["artillery", "extender"] },
+    { hull: "rifter", modules: ["blasters", "nano"], ammo: ["thermal", null] },
+    { hull: "rupture", modules: ["autocannons", "web", "dampener"], ammo: ["explosive", null, null] },
+    { hull: "tempest", modules: ["artillery", "extender"], ammo: ["explosive", null] },
   ];
+}
+
+export function normalizeFit(entry) {
+  const modules = [...(entry?.modules || [])];
+  const ammo = modules.map((id, index) => {
+    const spec = CATALOG[id];
+    if (spec?.slot !== "weapon") return null;
+    const choice = entry?.ammo?.[index];
+    return spec.ammo?.includes(choice) ? choice : spec.ammo[0];
+  });
+  return { hull: entry?.hull, modules, ammo };
 }
 
 export function validateFleet(list) {
@@ -96,9 +102,9 @@ export function statLine(ship, ships) {
   };
 }
 
-/** Furthest legal color distance. Red (4) only exists as the Overdrive step past 3. */
+/** Furthest color rank. Speed 4 already reaches red. Overdrive Movement adds one rank, capped at red. */
 export function travelLimit(speed, { overdrive, webbed, energy, odCooldown } = {}) {
-  const base = Math.min(Math.max(0, speed), 3);
+  const base = Math.min(Math.max(0, speed), 4);
   const can =
     overdrive === "movement" && !webbed && (energy ?? 0) >= 1 && !odCooldown;
   return can ? Math.min(base + 1, 4) : base;
@@ -126,76 +132,83 @@ export function dirToward(from, goal) {
   return bestI;
 }
 
-function closest(pos, goal) {
-  let best = null;
-  let bestD = Infinity;
-  for (const n of neighbors(pos)) {
-    const d = distance(n, goal);
-    if (d < bestD) {
-      bestD = d;
-      best = n;
-    }
-  }
-  return best;
+/**
+ * Printed movement cards, relative to the ship's facing.
+ * Step values are 60° clockwise from the nose: 0 forward, 1 forward-right,
+ * 3 straight back, 5 forward-left. `reach` is how many of those steps each
+ * color token travels (the last hex of that color on the card). `facingAt`
+ * is the nose after arriving, also clockwise from the starting facing.
+ * Orbit facings point at the hex two steps in front of the start.
+ */
+export const CARD_TEMPLATES = {
+  approach: {
+    steps: [0, 0, 0, 0, 0, 0],
+    reach: { 1: 3, 2: 4, 3: 5, 4: 6 },
+    trans: "low",
+  },
+  strafeRight: {
+    steps: [1, 1, 1, 1, 1],
+    reach: { 1: 2, 2: 3, 3: 4, 4: 5 },
+    trans: "high",
+  },
+  strafeLeft: {
+    steps: [5, 5, 5, 5, 5],
+    reach: { 1: 2, 2: 3, 3: 4, 4: 5 },
+    trans: "high",
+  },
+  keep: {
+    steps: [3, 3, 3, 3, 3],
+    reach: { 1: 2, 2: 3, 3: 4, 4: 5 },
+    trans: "low",
+  },
+  orbitRight: {
+    steps: [1, 1, 0, 0, 0, 5, 4, 3],
+    reach: { 1: 3, 2: 5, 3: 7, 4: 8 },
+    facingAt: [0, 5, 4, 4, 3, 3, 3, 3],
+    trans: "high",
+  },
+  orbitLeft: {
+    steps: [5, 5, 0, 0, 0, 1, 2, 3],
+    reach: { 1: 3, 2: 5, 3: 7, 4: 8 },
+    facingAt: [0, 1, 2, 2, 3, 3, 3, 3],
+    trans: "high",
+  },
+};
+
+/** Hexes traveled by a color token on a printed card. */
+export function cardReach(card, colorId) {
+  const spec = CARD_TEMPLATES[card];
+  const color = colorById(colorId);
+  if (!spec || !color) return 0;
+  return spec.reach[color.dist] || 0;
 }
 
-function farthest(pos, goal) {
-  let best = null;
-  let bestD = -1;
-  for (const n of neighbors(pos)) {
-    const d = distance(n, goal);
-    if (d > bestD) {
-      bestD = d;
-      best = n;
-    }
-  }
-  return best;
-}
-
-function stepOf(pos, facing, card, target, prefer) {
-  if (card === "strafeLeft" || card === "strafeRight") {
-    const sign = card === "strafeRight" ? 1 : -1;
-    return add(pos, DIRS[(facing + sign * 2 + 60) % 6]);
-  }
-  if (card === "approach") {
-    if (!target) return add(pos, DIRS[facing]);
-    if (distance(pos, target) <= 1) return null;
-    return closest(pos, target);
-  }
-  if (card === "keep") {
-    if (!target) return null;
-    const d = distance(pos, target);
-    if (d > prefer) return closest(pos, target);
-    if (d < prefer) return farthest(pos, target);
-    return null;
-  }
-  if (card === "orbitLeft" || card === "orbitRight") {
-    if (!target || (target.q === pos.q && target.r === pos.r)) return add(pos, DIRS[facing]);
-    const sign = card === "orbitRight" ? 1 : -1;
-    const away = dirToward(target, pos);
-    return add(pos, DIRS[(away + sign * 2 + 60) % 6]);
-  }
-  return null;
+/** Game directions increase counter-clockwise, so clockwise is a lower index. */
+function clockDir(facing, clockwise) {
+  return (facing - clockwise + 6) % 6;
 }
 
 /**
- * Simultaneous path from the plotting position. The focus is where the
- * target started this round. Ships may pass through hexes; they do not
- * enter the focus ship's hex.
+ * Path printed on the maneuver card, turned so forward matches `facing`.
+ * The color token stops on the last hex of that color. Off-board steps are
+ * not taken. Orbit turns the nose; the other cards leave it where it is.
  */
-export function planPath({ from, facing, card, dist, target, board, prefer = KEEP_RANGE }) {
-  const path = [{ q: from.q, r: from.r }];
-  const high = card === "orbitLeft" || card === "orbitRight" || card === "strafeLeft" || card === "strafeRight";
-  if (card === "hold" || !dist) return { path, transversal: "low" };
-  let pos = path[0];
-  for (let i = 0; i < dist; i++) {
-    const next = stepOf(pos, facing, card, target, prefer);
-    if (!next || !board.has(key(next.q, next.r))) break;
-    if (target && next.q === target.q && next.r === target.r) break;
-    pos = { q: next.q, r: next.r };
-    path.push(pos);
+export function planPath({ from, facing, card, dist, color, board }) {
+  const spec = CARD_TEMPLATES[card];
+  const start = { q: from.q, r: from.r };
+  let rank = color ? colorById(color)?.dist : dist;
+  if (dist) rank = Math.min(rank || dist, dist);
+  if (!spec || !rank) return { path: [start], transversal: "low", facing };
+  const steps = spec.reach[rank] || 0;
+  const path = [start];
+  let nose = facing;
+  for (let i = 0; i < steps; i++) {
+    const next = add(path[path.length - 1], DIRS[clockDir(facing, spec.steps[i])]);
+    if (!board.has(key(next.q, next.r))) break;
+    path.push({ q: next.q, r: next.r });
+    if (spec.facingAt) nose = clockDir(facing, spec.facingAt[i]);
   }
-  return { path, transversal: high ? "high" : "low" };
+  return { path, transversal: spec.trans, facing: nose };
 }
 
 export function transversalOf(card) {
@@ -205,19 +218,63 @@ export function transversalOf(card) {
   return "low";
 }
 
-export function engagement(dist, weapon, transversal) {
-  if (dist <= weapon.optimal) return transversal === "high" ? "yellow" : "red";
-  if (dist <= weapon.optimal + weapon.falloff) return transversal === "low" ? "yellow" : "miss";
-  return "miss";
+export function bandAt(weapon, dist) {
+  if (!weapon?.bands || dist < 1) return null;
+  return weapon.bands[dist] || null;
 }
 
-export function shotDamage(base, quality, { overdrive, overcharge } = {}) {
-  if (quality === "miss") return { quality: "miss", damage: 0, raw: "miss" };
-  let q = quality;
-  if (overcharge && overdrive && q === "yellow") q = "red";
-  let damage = q === "red" ? base : Math.max(0, base - 1);
-  if (overdrive) damage += 2;
-  return { quality: q, damage, raw: quality };
+/** Printed damage for a weapon at this distance. Overdrive Weapons adds 1. Overcharge turns yellow into that gun's red number. */
+export function weaponShot(weapon, dist, { overdrive, overcharge } = {}) {
+  const band = bandAt(weapon, dist);
+  if (!band) return { quality: "miss", damage: 0, zone: "miss" };
+  let zone = band[0];
+  let damage = band[1];
+  if (overcharge && overdrive && zone === "yellow") {
+    zone = "red";
+    damage = weapon.redDamage || damage;
+  }
+  if (overdrive) damage += 1;
+  return { quality: zone, damage, zone };
+}
+
+export function freshOverdrive() {
+  return { movement: false, weapons: false, shield: false };
+}
+
+export function isCooling(ship, kind) {
+  return !!ship?.odCool?.[kind];
+}
+
+/**
+ * Layered hit. Armor reduces the hit by 1 when the first point lands on armor.
+ * An ammo bonus applies only when that first point matches the ammo's layer.
+ * Explosive's bonus is knockback, and it matches hull.
+ */
+export function applyHit(ship, amount, { ammo } = {}) {
+  let damage = Math.max(0, amount);
+  const layer = ship.shield > 0 ? "shield" : (ship.armor || 0) > 0 ? "armor" : "hull";
+  if (layer === "armor") damage = Math.max(0, damage - 1);
+  const spec = AMMO[ammo];
+  let knock = 0;
+  if (spec && spec.layer === layer) {
+    if (spec.bonus === "damage") damage += 1;
+    if (spec.bonus === "knock") knock = 1;
+  }
+  let left = damage;
+  const shieldBefore = ship.shield;
+  const armorBefore = ship.armor || 0;
+  const hullBefore = ship.hullHp;
+  const shield = Math.min(ship.shield, left);
+  ship.shield -= shield;
+  left -= shield;
+  const armor = Math.min(ship.armor || 0, left);
+  ship.armor = (ship.armor || 0) - armor;
+  left -= armor;
+  const hull = Math.min(ship.hullHp, left);
+  ship.hullHp -= hull;
+  const dealt = shieldBefore - ship.shield + (armorBefore - (ship.armor || 0)) + (hullBefore - ship.hullHp);
+  if (dealt > 0) ship.tookDamage = true;
+  return { dealt, shield, armor, hull, knock, layer };
 }
 
 export function collisionOutcome(selfMods, selfRank, otherMods, otherRank) {
@@ -298,14 +355,16 @@ export function validateOrders(ships, orders, allShips) {
     if (card === "hold" && !MANEUVERS.includes(spend)) return `${ship.name} must place a card face-down to hold.`;
     used[spend] = (used[spend] || 0) + 1;
     if (used[spend] > CARD_COPIES) return `Only ${CARD_COPIES} ${spend} cards.`;
-    const refreshed = card === "hold";
+    if (card === "hold" && (order.overdrive || order.active)) {
+      return `${ship.name} holds and cannot act.`;
+    }
     if (order.overdrive) {
       if (!["movement", "weapons", "shield"].includes(order.overdrive)) return "Unknown Overdrive.";
-      if (ship.odCooldown && !refreshed) return `${ship.name} must Hold before Overdrive is ready.`;
-      const energy = refreshed ? stats.energyMax : ship.energy;
-      if (energy < 1) return `${ship.name} has no energy.`;
+      if (isCooling(ship, order.overdrive)) {
+        return `${ship.name} must Hold before that Overdrive is ready.`;
+      }
+      if (ship.energy < 1) return `${ship.name} has no energy.`;
       if (order.overdrive === "movement" && ship.webbed) return `${ship.name} is webbed and cannot Overdrive Movement.`;
-      if (order.overdrive === "movement" && card === "hold") return "Hold does not Overdrive Movement.";
     }
     if (card !== "hold") {
       const color = colorById(order.color);
@@ -314,7 +373,7 @@ export function validateOrders(ships, orders, allShips) {
         overdrive: order.overdrive,
         webbed: ship.webbed,
         energy: ship.energy,
-        odCooldown: ship.odCooldown,
+        odCooldown: isCooling(ship, "movement"),
       });
       if (color.dist > limit || color.dist < 1) {
         return `${ship.name} cannot play ${color.name}.`;
@@ -325,11 +384,8 @@ export function validateOrders(ships, orders, allShips) {
       const spec = CATALOG[id];
       if (!spec || spec.slot !== "active") return "That module is not active.";
       if (!ship.modules.includes(id)) return `${ship.name} does not fit ${spec.name}.`;
-      if (ship.spent?.[id] && order.card !== "hold") return `${spec.name} is spent until you Hold.`;
+      if (ship.spent?.[id]) return `${spec.name} is spent until you Hold.`;
       if ((id === "neut" || id === "web") && !order.active.targetId) return `${spec.name} needs a target.`;
-      if (id === "overcharge" && order.overdrive !== "weapons") {
-        return "Weapon Overcharge requires Weapons Overdrive.";
-      }
     }
   }
   return null;
@@ -339,58 +395,39 @@ export function weaponAt(ship, index) {
   const id = ship.modules[index];
   const spec = CATALOG[id];
   if (!spec || spec.slot !== "weapon") return null;
-  return { index, id, ...spec };
+  const ammo = ship.ammo?.[index] || spec.ammo?.[0] || null;
+  return { index, id, ...spec, ammo };
 }
 
 export function inWeaponRange(weapon, dist) {
-  return dist <= weapon.optimal + weapon.falloff;
+  return !!bandAt(weapon, dist);
 }
 
-export function deploymentSlots(count, board) {
-  const radius = ARENA_RADIUS;
-  const used = new Set();
-  const slots = [];
-  const freeNear = (origin) => {
-    const queue = [origin];
-    const seen = new Set([key(origin.q, origin.r)]);
-    while (queue.length) {
-      const h = queue.shift();
-      const k = key(h.q, h.r);
-      if (board.has(k) && !used.has(k)) return h;
-      for (const n of neighbors(h)) {
-        const nk = key(n.q, n.r);
-        if (seen.has(nk)) continue;
-        seen.add(nk);
-        if (distance(n, origin) > radius + 1) continue;
-        queue.push(n);
-      }
-    }
-    return null;
+export function deploymentSlots(count, board, foundations = PLATE_ORIGINS) {
+  const plates = (foundations.length ? foundations : PLATE_ORIGINS).map((p) => ({ q: p.q, r: p.r }));
+  const order = [0, 3, 1, 2].filter((index) => plates[index]);
+  while (order.length < count) order.push(order.length % plates.length);
+  const center = {
+    q: Math.round(plates.reduce((sum, plate) => sum + plate.q, 0) / plates.length),
+    r: Math.round(plates.reduce((sum, plate) => sum + plate.r, 0) / plates.length),
   };
-  for (let p = 0; p < count; p++) {
-    const dir = Math.floor((p * 6) / count) % 6;
-    const inward = (dir + 3) % 6;
-    const side = (dir + 2) % 6;
-    const origin = {
-      q: DIRS[dir].q * (radius - 1),
-      r: DIRS[dir].r * (radius - 1),
-    };
+  const used = new Set();
+  const cells = [...board].map((id) => parseKey(id));
+  return order.slice(0, count).map((index) => {
+    const plate = plates[index];
+    const outward = dirToward(center, plate);
+    const goal = add(plate, DIRS[outward]);
+    const near = cells
+      .filter((cell) => !used.has(key(cell.q, cell.r)))
+      .sort((a, b) => distance(a, goal) - distance(b, goal) || distance(a, plate) - distance(b, plate));
     const ships = [];
-    for (const off of [-1, 0, 1]) {
-      const guess = {
-        q: origin.q + DIRS[side].q * off,
-        r: origin.r + DIRS[side].r * off,
-      };
-      const spot = board.has(key(guess.q, guess.r)) && !used.has(key(guess.q, guess.r))
-        ? guess
-        : freeNear(origin);
-      if (!spot) continue;
-      used.add(key(spot.q, spot.r));
-      ships.push({ q: spot.q, r: spot.r, facing: inward });
+    for (const cell of near) {
+      if (ships.length === 3) break;
+      used.add(key(cell.q, cell.r));
+      ships.push({ q: cell.q, r: cell.r, facing: dirToward(cell, center) });
     }
-    slots.push(ships);
-  }
-  return slots;
+    return ships;
+  });
 }
 
 export { COLORS };

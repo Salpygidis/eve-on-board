@@ -10,10 +10,11 @@ export const SHIPS = {
     speed: 3,
     agility: 3,
     energy: 2,
-    racks: 2,
-    damage: 3,
-    shield: 3,
+    racks: 3,
+    shield: 2,
+    armor: 2,
     hull: 3,
+    art: "cards/rifter.jpg",
   },
   rupture: {
     id: "rupture",
@@ -22,10 +23,11 @@ export const SHIPS = {
     speed: 2,
     agility: 2,
     energy: 2,
-    racks: 3,
-    damage: 3,
-    shield: 4,
-    hull: 5,
+    racks: 4,
+    shield: 3,
+    armor: 2,
+    hull: 4,
+    art: "cards/rupture.jpg",
   },
   tempest: {
     id: "tempest",
@@ -34,17 +36,17 @@ export const SHIPS = {
     speed: 1,
     agility: 1,
     energy: 3,
-    racks: 4,
-    damage: 4,
-    shield: 5,
-    hull: 7,
+    racks: 5,
+    shield: 4,
+    armor: 4,
+    hull: 5,
+    art: "cards/tempest.jpg",
   },
 };
 
 /**
- * Distance per color. Speed N may pick a color of distance <= N (capped at 3)
- * without Overdrive. Overdrive Movement adds one color, up to Red (4).
- * Red is never legal unless that extra color is paid for.
+ * Color rank on a movement card. Speed 1 reaches blue, 2 green, 3 yellow.
+ * Speed 4, or Overdrive Movement, reaches red.
  */
 export const COLORS = [
   { id: "lb", name: "Light Blue", dist: 1, hex: "#7ec8ff" },
@@ -66,87 +68,177 @@ export const CARD_COPIES = 2;
 export const KEEP_RANGE = 3;
 
 export const MANEUVER_INFO = {
-  approach: { name: "Approach", trans: "low", blurb: "Step toward the focus until you are adjacent." },
-  orbitLeft: { name: "Orbit Left", trans: "high", blurb: "Circle the focus, staying at range." },
-  orbitRight: { name: "Orbit Right", trans: "high", blurb: "Circle the focus the other way." },
-  keep: { name: "Keep at Range", trans: "low", blurb: "Move radially toward distance 3, then stop." },
-  strafeLeft: { name: "Strafe Left", trans: "high", blurb: "Slide flat-to-flat, two faces left of your bow." },
-  strafeRight: { name: "Strafe Right", trans: "high", blurb: "Slide flat-to-flat, two faces right of your bow." },
-  hold: { name: "Hold", trans: "low", blurb: "Spend any card face-down. Refill energy, +1 shield, reset modules and Overdrive." },
+  approach: {
+    name: "Approach",
+    trans: "low",
+    art: "cards/approach.jpg",
+    blurb: "Straight forward. Blue 3, green 4, yellow 5, red 6.",
+  },
+  orbitLeft: {
+    name: "Orbit Left",
+    trans: "high",
+    art: "cards/orbit-left.jpg",
+    blurb: "Arc left around the hexes ahead and turn inward. Light blue 3, green 5, yellow 7, red 8.",
+  },
+  orbitRight: {
+    name: "Orbit Right",
+    trans: "high",
+    art: "cards/orbit-right.jpg",
+    blurb: "Arc right around the hexes ahead and turn inward. Light blue 3, green 5, yellow 7, red 8.",
+  },
+  keep: {
+    name: "Keep at Range",
+    trans: "low",
+    art: "cards/keep.jpg",
+    blurb: "Back straight up, nose still forward. Blue 2, green 3, yellow 4, red 5.",
+  },
+  strafeLeft: {
+    name: "Strafe Left",
+    trans: "high",
+    art: "cards/strafe-left.jpg",
+    blurb: "Forward-left. Blue 2, green 3, yellow 4, red 5. Nose stays put.",
+  },
+  strafeRight: {
+    name: "Strafe Right",
+    trans: "high",
+    art: "cards/strafe-right.jpg",
+    blurb: "Forward-right. Blue 2, green 3, yellow 4, red 5. Nose stays put.",
+  },
+  hold: {
+    name: "Hold",
+    trans: "low",
+    art: "",
+    blurb: "Skip the turn. If you survive the shooting, refill energy, +1 shield, and reset modules and Overdrive.",
+  },
+};
+
+/**
+ * Ammo-circle centers on the weapon card art, in the same order as `ammo`.
+ * Values are percentages of the card width and height.
+ */
+export const AMMO_SPOTS = {
+  blasters: [[40.4, 77.5], [60.6, 77.5]],
+  autocannons: [[19.8, 77.5], [39.9, 77.5], [60.1, 77.5], [80.3, 77.5]],
+  rails: [[39.3, 77.6], [59.5, 77.6]],
+  artillery: [[29.5, 77.5], [49.7, 77.5], [69.9, 77.5]],
+  rockets: [[39.8, 77.5], [60.0, 77.5]],
+};
+
+/** Ammo is chosen once per weapon and stays for the match. */
+export const AMMO = {
+  kinetic: { id: "kinetic", name: "Kinetic", layer: "armor", bonus: "damage" },
+  thermal: { id: "thermal", name: "Thermal", layer: "hull", bonus: "damage" },
+  explosive: { id: "explosive", name: "Explosive", layer: "hull", bonus: "knock" },
+  em: { id: "em", name: "EM", layer: "shield", bonus: "damage" },
 };
 
 function fit(slot, cost, extra) {
   return { slot, cost, ...extra };
 }
 
+function gun(cost, pattern, extra) {
+  const bands = [null, ...pattern];
+  const reds = pattern.filter((b) => b && b[0] === "red").map((b) => b[1]);
+  return fit("weapon", cost, { ...extra, bands, redDamage: reds.length ? Math.max(...reds) : 0 });
+}
+
+const GUN = { small: 2, medium: 2, large: 2 };
+
 export const CATALOG = {
-  blasters: fit("weapon", { small: 1, medium: 1, large: 1 }, {
-    name: "Blasters", optimal: 1, falloff: 1, damageType: "Thermal",
-    blurb: "Optimal 1, falloff 1. Thermal.",
+  blasters: gun(GUN, [["red", 4], ["red", 4], ["yellow", 2], null, null, null, null], {
+    name: "Blasters",
+    ammo: ["thermal", "kinetic"],
+    art: "cards/blasters.jpg",
+    blurb: "Range 1–2 red 4, range 3 yellow 2.",
   }),
-  autocannons: fit("weapon", { small: 1, medium: 1, large: 1 }, {
-    name: "Autocannons", optimal: 2, falloff: 2, damageType: "Kinetic",
-    blurb: "Optimal 2, falloff 2. Kinetic.",
+  autocannons: gun(GUN, [["yellow", 2], ["red", 3], ["red", 3], ["yellow", 2], null, null, null], {
+    name: "Lasers / Autocannons",
+    ammo: ["explosive", "kinetic", "thermal", "em"],
+    art: "cards/autocannons.jpg",
+    blurb: "Range 1 yellow 2, 2–3 red 3, 4 yellow 2.",
   }),
-  rails: fit("weapon", { small: 1, medium: 1, large: 2 }, {
-    name: "Rails", optimal: 4, falloff: 2, damageType: "Kinetic",
-    blurb: "Optimal 4, falloff 2. Kinetic.",
+  rails: gun(GUN, [null, ["yellow", 2], ["red", 3], ["red", 3], ["yellow", 2], null, null], {
+    name: "Rails",
+    ammo: ["kinetic", "thermal"],
+    art: "cards/rails.jpg",
+    blurb: "Range 2 yellow 2, 3–4 red 3, 5 yellow 2.",
   }),
-  artillery: fit("weapon", { small: null, medium: 2, large: 2 }, {
-    name: "Artillery", optimal: 5, falloff: 1, damageType: "Explosive",
-    blurb: "Optimal 5, falloff 1. Explosive. No small ships.",
+  artillery: gun(GUN, [null, null, ["yellow", 2], ["red", 4], ["red", 4], ["yellow", 2], null], {
+    name: "Artillery",
+    ammo: ["kinetic", "thermal", "explosive"],
+    art: "cards/artillery.jpg",
+    blurb: "Range 3 yellow 2, 4–5 red 4, 6 yellow 2.",
   }),
-  rockets: fit("weapon", { small: 1, medium: 1, large: 1 }, {
-    name: "Rockets", optimal: 3, falloff: 3, damageType: "Explosive",
-    blurb: "Optimal 3, falloff 3. Explosive.",
+  rockets: gun(GUN, [null, ["yellow", 2], ["yellow", 3], ["red", 3], ["yellow", 2], ["yellow", 2], null], {
+    name: "Rockets",
+    ammo: ["kinetic", "explosive"],
+    art: "cards/rockets.jpg",
+    blurb: "Range 2 yellow 2, 3 yellow 3, 4 red 3, 5–6 yellow 2.",
   }),
-  overcharge: fit("active", { small: 1, medium: 1, large: 1 }, {
+  overcharge: fit("passive", { small: 1, medium: 1, large: 1 }, {
     name: "Weapon Overcharge",
-    blurb: "With Weapons Overdrive, a yellow hit counts as red.",
+    art: "cards/overcharge.jpg",
+    blurb: "When you Overdrive Weapons, yellow bands hit as red.",
   }),
   gyro: fit("passive", { small: 1, medium: 2, large: 2 }, {
     name: "Gyrostabilizer",
-    blurb: "After taking damage, slide 1 hex if you can.",
+    art: "cards/gyro.jpg",
+    blurb: "After taking damage, you may slide 1 hex.",
   }),
   rapid: fit("passive", { small: 1, medium: 1, large: 2 }, {
     name: "Rapid Weapons",
-    blurb: "After a red hit, you may fire a second weapon.",
+    art: "cards/rapid.jpg",
+    blurb: "After a red-zone hit, you may fire a different weapon.",
   }),
   neut: fit("active", { small: 1, medium: 1, large: 1 }, {
     name: "Energy Neutralizer", range: 5,
+    art: "cards/neut.jpg",
     blurb: "An enemy within 5 loses 1 energy.",
   }),
   web: fit("active", { small: 1, medium: 1, large: 1 }, {
     name: "Stasis Webifier", range: 5,
-    blurb: "An enemy within 5 loses 1 speed and 1 agility next turn and cannot Overdrive Movement.",
+    art: "cards/web.jpg",
+    blurb: "An enemy within 5 loses 1 speed and 1 agility next turn and cannot Overdrive speed.",
   }),
-  stealth: fit("active", { small: 1, medium: 2, large: null }, {
+  stealth: fit("active", { small: 2, medium: 2, large: 3 }, {
     name: "Stealth Module",
-    blurb: "Hide the move. You cannot be targeted this activation.",
+    art: "cards/stealth.jpg",
+    blurb: "Stay put and untargetable this round. The plotted move happens at the end of the next movement.",
   }),
   injector: fit("passive", { small: null, medium: 2, large: 2 }, {
     name: "Overdrive Injector",
-    blurb: "+1 speed. Medium and large only.",
+    art: "cards/injector.jpg",
+    blurb: "+1 speed. A speed of 4 reaches red.",
   }),
   nano: fit("passive", { small: 1, medium: 1, large: 2 }, {
     name: "Nanofiber Structure",
+    art: "cards/nano.jpg",
     blurb: "+1 agility.",
   }),
   extender: fit("passive", { small: null, medium: null, large: 2 }, {
     name: "Shield Extender",
+    art: "cards/extender.jpg",
     blurb: "+1 max shield to every friendly ship, including this one.",
   }),
   dampener: fit("passive", { small: 1, medium: 1, large: 1 }, {
     name: "Collision Dampeners",
-    blurb: "−1 collision damage (minimum 0) and −1 knockback.",
+    art: "cards/dampener.jpg",
+    blurb: "When you collide, −1 hull damage (minimum 0) and −1 knockback.",
   }),
   ram: fit("passive", { small: 1, medium: 1, large: 1 }, {
     name: "Ramming Array",
-    blurb: "The other ship takes +1 collision damage and +1 knockback.",
+    art: "cards/ram.jpg",
+    blurb: "When you collide, the other ship takes +1 hull and +1 knockback. You still take normal collision damage.",
   }),
-  bomb: fit("active", { small: 1, medium: 1, large: 1 }, {
+  bomb: fit("active", { small: 2, medium: 2, large: 2 }, {
     name: "Smart Bomb",
-    blurb: "Mine your current hex. It blows after movement if another ship is there. You do not set it off on the turn you drop it.",
+    art: "cards/bomb.jpg",
+    blurb: "Drop a bomb on the hex behind you. It explodes at the end of the attack phase. Adjacent hexes take 5, the ring beyond takes 2.",
+  }),
+  repair: fit("passive", { small: 1, medium: 1, large: 1 }, {
+    name: "Auxiliary Armor Repairer",
+    art: "cards/repair.jpg",
+    blurb: "When you Hold and survive, also recover 1 armor.",
   }),
 };
 

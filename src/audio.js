@@ -4,7 +4,7 @@ let volume = 1;
 let lastAudible = 1;
 
 const VOLUME_KEY = "skirmish.volume";
-const BGM_URL = "/blorps-bgm.mp3";
+const BGM_URL = "/final-drop.mp3";
 const BGM_VOLUME = 0.35;
 const bgm = new Audio(BGM_URL);
 bgm.loop = true;
@@ -64,7 +64,7 @@ function syncBgm() {
   }
 }
 
-/** Loop the race track during a match. Login and waiting rooms stay quiet. */
+/** Loop the battle track once fleets are on the grid. Lobby and fitting stay quiet. */
 export function setMatchMusic(on) {
   wantBgm = !!on;
   syncBgm();

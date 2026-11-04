@@ -38,6 +38,17 @@ function park(game, keep) {
   }
 }
 
+function drain(game) {
+  let guard = 0;
+  while (game.phase === "attack" && guard < 16) {
+    const ship = game.shipById(game.activationShipId);
+    if (!ship) break;
+    const res = game.submitAttacks(ship.playerId, { pass: true });
+    assert.equal(res.ok, true, res.error);
+    guard += 1;
+  }
+}
+
 function orders(ships, patch) {
   return ships.map((ship, i) => ({
     shipId: ship.id,
@@ -88,7 +99,7 @@ describe("skirmish flow", () => {
     small.q = 0;
     small.r = 0;
     small.facing = 0;
-    big.q = 2;
+    big.q = 3;
     big.r = 0;
     big.facing = 3;
     park(game, [small, big]);
@@ -118,63 +129,44 @@ describe("skirmish flow", () => {
     assert.equal(game.events.some((e) => e.type === "attack" && e.shipId === small.id), false);
   });
 
-  it("restores a holding ship and leaves a smart bomb until someone else enters", () => {
+  it("restores a holding ship only after it survives the round", () => {
     const game = match();
-    lockFleets(game, rifters(["blasters", "bomb"]), rifters(["blasters", "bomb"]));
+    lockFleets(game, rifters(["nano"]), rifters(["nano"]));
+    const dropper = game.living("p1")[0];
+    dropper.energy = 0;
+    dropper.shield = 0;
+    park(game, [dropper]);
+    const first = game.submitOrders("p1", orders(game.living("p1"), () => ({ card: "hold" })));
+    const second = game.submitOrders("p2", orders(game.living("p2"), () => ({ card: "hold" })));
+    assert.equal(first.ok, true, first.error);
+    assert.equal(second.ok, true, second.error);
+    assert.equal(dropper.energy, dropper.energyMax);
+    assert.equal(dropper.shield, 1);
+  });
+
+  it("drops a smart bomb behind the ship and detonates it after attacks", () => {
+    const game = match();
+    lockFleets(game, rifters(["bomb", "nano"]), rifters(["nano"]));
     const dropper = game.living("p1")[0];
     const visitor = game.living("p2")[0];
     dropper.q = 0;
     dropper.r = 0;
-    dropper.energy = 0;
-    dropper.shield = 1;
-    visitor.q = 4;
-    visitor.r = -2;
-    const bait = game.living("p1").find((s) => s !== dropper);
-    const anchor = game.living("p2").find((s) => s !== visitor);
-    bait.q = -3;
-    bait.r = 0;
-    anchor.q = 0;
-    anchor.r = -3;
-    park(game, [dropper, visitor, bait, anchor]);
+    dropper.facing = 0;
+    visitor.q = -1;
+    visitor.r = 0;
+    park(game, [dropper, visitor]);
     const first = game.submitOrders(
       "p1",
       orders(game.living("p1"), (ship) =>
-        ship.id === dropper.id ? { card: "hold", active: { id: "bomb" } } : { card: "hold" }
+        ship.id === dropper.id ? { card: "approach", color: "lb", active: { id: "bomb" }, holdSpend: null } : { card: "hold" }
       )
     );
-    const second = game.submitOrders(
-      "p2",
-      orders(game.living("p2"), () => ({ card: "hold" }))
-    );
+    const second = game.submitOrders("p2", orders(game.living("p2"), () => ({ card: "hold" })));
     assert.equal(first.ok, true, first.error);
     assert.equal(second.ok, true, second.error);
-    assert.equal(dropper.energy, dropper.energyMax);
-    assert.equal(dropper.shield, 2);
-    assert.equal(game.bombs.length, 1);
-    assert.equal(visitor.hullHp, visitor.hullMax);
-
-    visitor.q = 1;
-    visitor.r = 0;
-    const againA = game.submitOrders(
-      "p1",
-      orders(game.living("p1"), (ship) =>
-        ship.id === dropper.id
-          ? { card: "approach", color: "lb", focusId: anchor.id, holdSpend: null }
-          : { card: "hold" }
-      )
-    );
-    const againB = game.submitOrders(
-      "p2",
-      orders(game.living("p2"), (ship) =>
-        ship.id === visitor.id
-          ? { card: "approach", color: "lb", focusId: bait.id, holdSpend: null }
-          : { card: "hold" }
-      )
-    );
-    assert.equal(againA.ok, true, againA.error);
-    assert.equal(againB.ok, true, againB.error);
+    drain(game);
     assert.equal(game.bombs.length, 0);
-    assert.ok(visitor.hullHp < visitor.hullMax || visitor.shield < visitor.shieldMax);
+    assert.ok(visitor.shield < visitor.shieldMax || visitor.armor < visitor.armorMax || visitor.hullHp < visitor.hullMax);
     assert.equal(dropper.hullHp, dropper.hullMax);
   });
 
@@ -185,19 +177,22 @@ describe("skirmish flow", () => {
     const webber = game.living("p2")[0];
     target.q = 0;
     target.r = 0;
-    webber.q = 3;
-    webber.r = 0;
+    target.facing = 0;
+    webber.q = 2;
+    webber.r = 1;
+    webber.facing = 0;
     park(game, [target, webber]);
-    assert.equal(distance(target, webber), 3);
+    assert.ok(distance(target, webber) <= 5);
     const a = game.submitOrders("p1", orders(game.living("p1"), () => ({ card: "hold" })));
     const b = game.submitOrders(
       "p2",
       orders(game.living("p2"), (ship) =>
-        ship.id === webber.id ? { card: "hold", active: { id: "web", targetId: target.id } } : { card: "hold" }
+        ship.id === webber.id ? { card: "keep", color: "lb", active: { id: "web", targetId: target.id }, holdSpend: null } : { card: "hold" }
       )
     );
     assert.equal(a.ok, true, a.error);
     assert.equal(b.ok, true, b.error);
+    drain(game);
     assert.equal(target.webbed, true);
     const fast = game.submitOrders(
       "p1",
@@ -215,21 +210,28 @@ describe("skirmish flow", () => {
     const game = match();
     lockFleets(
       game,
-      [{ hull: "rifter", modules: ["blasters", "stealth"] }, { hull: "rifter", modules: ["blasters"] }, { hull: "rifter", modules: ["rockets"] }],
+      [{ hull: "rifter", modules: ["stealth", "nano"] }, { hull: "rifter", modules: ["blasters"] }, { hull: "rifter", modules: ["rockets"] }],
       rifters(["blasters"])
     );
     const ninja = game.ships.find((s) => s.modules.includes("stealth"));
+    const gunner = game.living("p1").find((s) => s.modules.includes("blasters"));
     const foe = game.living("p2")[0];
     ninja.q = 0;
     ninja.r = 0;
-    foe.q = 1;
+    ninja.facing = 0;
+    gunner.q = 4;
+    gunner.r = 0;
+    gunner.facing = 0;
+    foe.q = 3;
     foe.r = 0;
-    park(game, [ninja, foe]);
+    park(game, [ninja, gunner, foe]);
     const a = game.submitOrders(
       "p1",
-      orders(game.living("p1"), (ship) =>
-        ship.id === ninja.id ? { card: "hold", active: { id: "stealth" } } : { card: "hold" }
-      )
+      orders(game.living("p1"), (ship) => {
+        if (ship.id === ninja.id) return { card: "approach", color: "lb", active: { id: "stealth" }, holdSpend: null };
+        if (ship.id === gunner.id) return { card: "approach", color: "lb", holdSpend: null };
+        return { card: "hold" };
+      })
     );
     const b = game.submitOrders("p2", orders(game.living("p2"), () => ({ card: "hold" })));
     assert.equal(a.ok, true, a.error);
@@ -240,6 +242,6 @@ describe("skirmish flow", () => {
     const view = game.toJSON("p2");
     const hidden = view.ships.find((s) => s.id === ninja.id);
     assert.equal(hidden.maneuver, "cloaked");
-    assert.equal(game.toJSON("p1").ships.find((s) => s.id === ninja.id).maneuver, "hold");
+    assert.equal(game.toJSON("p1").ships.find((s) => s.id === ninja.id).maneuver, "approach");
   });
 });

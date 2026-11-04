@@ -24,11 +24,11 @@
             <span>Callsign</span>
             <input id="name" maxlength="14" placeholder="Rook" autocomplete="off" />
           </label>
-          <div class="row-btns">
+          <div class="row-btns lobby-actions">
             <button id="btn-create" class="btn primary" type="button">Create room</button>
+            <button id="btn-practice" class="btn" type="button">Practice vs bot</button>
             <button id="btn-how" class="btn ghost" type="button">How to play</button>
           </div>
-          <button id="btn-practice" class="btn" type="button">Practice vs bot</button>
           <div class="join-row">
             <input id="code" maxlength="6" placeholder="ROOM" spellcheck="false" autocomplete="off" class="code-input" />
             <button id="btn-join" class="btn" type="button">Join</button>
@@ -55,11 +55,12 @@
             <strong id="bot-count">0</strong>
             <button id="btn-bots-more" class="btn tiny" type="button" aria-label="More bots">+</button>
           </div>
+          <div id="seat-row" class="row-btns hidden"></div>
           <div class="row-btns">
             <button id="btn-start" class="btn primary hidden" type="button">Launch</button>
             <button id="btn-leave" class="btn ghost" type="button">Leave</button>
           </div>
-          <p class="hint">2–4 pilots. Share the code, or add a bot. Spectators can watch a live room.</p>
+          <p class="hint">2–4 pilots. Share the code, or add a bot. Spectators can swap in for a bot or take an open seat.</p>
         </div>
       </section>
 
@@ -74,6 +75,7 @@
             <label class="volume"><input id="volume" type="range" min="0" max="100" value="100" aria-label="Volume" /></label>
             <button id="btn-mute" class="icon-btn" type="button" aria-label="Mute">🔊</button>
             <button id="btn-help" class="icon-btn" type="button" aria-label="Help">?</button>
+            <button id="btn-hand" class="icon-btn" type="button">My cards</button>
             <button id="dock-toggle" class="icon-btn" type="button">Orders</button>
             <button id="btn-quit" class="icon-btn" type="button">Leave</button>
           </div>

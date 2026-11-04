@@ -1,6 +1,8 @@
 import * as THREE from "three";
 import { DIRS, HEX_SIZE, hexToWorld, key } from "../shared/hex.js";
-import { makeTile, tileDepth } from "./meshes.js";
+import { foundationPose } from "../shared/boardFit.js";
+import { loadBoardModels } from "./boardModels.js";
+import { layoutBoard, makeTile, tileDepth, useBoardModels } from "./meshes.js";
 import { tween } from "./tweens.js";
 import { describeHex, hideHexTip, showHexTip } from "./hexTip.js";
 
@@ -16,6 +18,12 @@ export class GameScene {
     this.bombs = new Map();
     this.preview = [];
     this.lastPreview = [];
+    this.tableSpec = [];
+    this.table = null;
+    this.tableCenter = null;
+    this.tableYaw = 0;
+    this.handView = false;
+    this.cardTextures = new Map();
     this.queue = Promise.resolve();
     this.target = new THREE.Vector3();
     this.look = new THREE.Vector3();
@@ -48,6 +56,25 @@ export class GameScene {
     this.loop = this.loop.bind(this);
     requestAnimationFrame(this.loop);
     window.addEventListener("resize", () => this.resize());
+    const dock = document.getElementById("dock");
+    if (dock && typeof ResizeObserver !== "undefined") {
+      new ResizeObserver(() => this.resize()).observe(dock);
+    }
+    this.modelsReady = false;
+    loadBoardModels()
+      .then((models) => {
+        this.models = models;
+        useBoardModels(models);
+        this.modelsReady = true;
+        if (this.state) {
+          this.rebuild(this.state);
+          this.syncShips(this.state);
+          this.syncBombs(this.state);
+        } else {
+          this.buildLobby();
+        }
+      })
+      .catch((err) => console.error(err));
     this.buildLobby();
   }
 
@@ -98,23 +125,16 @@ export class GameScene {
 
   buildLobby() {
     this.clearBoard();
-    const demo = [
-      { q: 0, r: 0, terrain: "void", elevation: 0, tint: "#2a4170" },
-      { q: 1, r: 0, terrain: "void", elevation: 0, tint: "#1b2c4d" },
-      { q: 0, r: -1, terrain: "void", elevation: 0, tint: "#152238" },
-      { q: -1, r: 0, terrain: "void", elevation: 0, tint: "#1b2c4d" },
-      { q: -1, r: 1, terrain: "void", elevation: 0, tint: "#152238" },
-      { q: 0, r: 1, terrain: "void", elevation: 0, tint: "#1b2c4d" },
-      { q: 1, r: -1, terrain: "void", elevation: 0, tint: "#152238" },
-    ];
-    for (const hex of demo) this.addHex(hex);
-    const a = this.addShipMesh("demo-a", { color: "#ffb020", size: "small", q: 0, r: 0, facing: 0, shield: 3, shieldMax: 3, hullHp: 3, hullMax: 3, name: "" });
-    const b = this.addShipMesh("demo-b", { color: "#3ee0ff", size: "medium", q: 1, r: -1, facing: 3, shield: 4, shieldMax: 4, hullHp: 5, hullMax: 5, name: "" });
-    a.userData.bob = true;
-    b.userData.bob = true;
     this.look.set(0, 0, 0);
     this.target.copy(this.look);
-    this.spherical = { theta: 0.4, phi: 0.95, r: 8 };
+    this.spherical = { theta: 0.55, phi: 0.98, r: 16 };
+    if (!this.models?.foundation) return;
+    layoutBoard([{ q: 0, r: 0, terrain: "open", elevation: 0 }]);
+    this.addFoundations([{ q: 0, r: 0 }]);
+    const a = this.addShipMesh("demo-a", { color: "#ffb020", size: "small", q: 0, r: 0, facing: 0, shield: 2, shieldMax: 2, hullHp: 3, hullMax: 3, name: "" });
+    const b = this.addShipMesh("demo-b", { color: "#3ee0ff", size: "medium", q: 1, r: -1, facing: 3, shield: 3, shieldMax: 3, hullHp: 4, hullMax: 4, name: "" });
+    a.userData.bob = true;
+    b.userData.bob = true;
   }
 
   clearBoard() {
@@ -127,6 +147,9 @@ export class GameScene {
     this.ships.clear();
     this.bombs.clear();
     this.preview = [];
+    this.table = null;
+    this.tableCenter = null;
+    this.marks = null;
   }
 
   addHex(hex) {
@@ -150,21 +173,66 @@ export class GameScene {
     this.hexes.set(key(hex.q, hex.r), { mesh: tile, hex });
   }
 
+  addFoundations(origins) {
+    if (!this.models?.foundation) return;
+    const pose = foundationPose();
+    const plates = origins?.length ? origins : [{ q: 0, r: 0 }];
+    this.foundationOrigins = plates;
+    for (const origin of plates) {
+      const { x, z } = hexToWorld(origin.q || 0, origin.r || 0);
+      const base = new THREE.Mesh(this.models.foundation, this.models.foundationMat);
+      base.rotation.y = pose.yaw;
+      base.scale.setScalar(pose.scale);
+      base.position.set(pose.x + x, 0, pose.z + z);
+      base.receiveShadow = true;
+      base.castShadow = false;
+      base.raycast = () => {};
+      base.userData.kind = "foundation";
+      if (this.models.foundationTop && this.models.spaceTopMat) {
+        const top = new THREE.Mesh(this.models.foundationTop, this.spaceMaterial(origin, plates));
+        top.raycast = () => {};
+        top.castShadow = false;
+        base.add(top);
+      }
+      this.scene.add(base);
+    }
+  }
+
+  spaceMaterial(origin, plates) {
+    const base = this.models.spaceTopMat;
+    if (!plates || plates.length < 2) return base;
+    const map = base.map.clone();
+    map.wrapS = THREE.ClampToEdgeWrapping;
+    map.wrapT = THREE.ClampToEdgeWrapping;
+    map.center.set(0.5, 0.5);
+    map.rotation = purpleInwardRotation(origin, plates);
+    map.needsUpdate = true;
+    const mat = base.clone();
+    mat.map = map;
+    return mat;
+  }
+
   rebuild(state) {
     this.clearBoard();
+    if (this.models) layoutBoard(state.hexes);
+    this.addFoundations(state.foundations);
     for (const hex of state.hexes || []) this.addHex(hex);
     let max = 1;
     for (const hex of state.hexes || []) {
       const { x, z } = hexToWorld(hex.q, hex.r);
       max = Math.max(max, Math.hypot(x, z));
     }
-    if (this.ground) this.ground.scale.setScalar(Math.max(1, (max + 8) / 18));
-    this.spherical.r = this.isMobile() ? max * 1.45 + 4 : max * 1.2 + 5;
-    // The order panel covers the right side on a desktop, so look a little
-    // toward +X and the arena sits in the open part of the screen.
-    const bias = this.isMobile() ? 0 : Math.min(4.5, max * 0.35);
-    this.look.set(bias, 0, 0);
+    if (this.ground) this.ground.scale.setScalar(Math.max(1, (max + 12) / 18));
+    if (this.scene.fog) {
+      this.scene.fog.near = Math.max(28, max);
+      this.scene.fog.far = Math.max(70, max * 5);
+    }
+    const reserve = this.isMobile() ? 0 : 396;
+    const fit = reserve ? window.innerWidth / Math.max(520, window.innerWidth - reserve) : 1;
+    this.spherical.r = (this.isMobile() ? max * 1.55 + 6 : max * 1.35 + 8) * fit;
+    this.look.set(0, 0, 0);
     this.target.copy(this.look);
+    this.resize();
   }
 
   apply(state, events = []) {
@@ -176,6 +244,7 @@ export class GameScene {
       this.syncShips(state);
       this.syncBombs(state);
       this.drawPreview();
+      this.drawTable();
     });
     this.queue = run.catch((err) => console.error(err));
   }
@@ -205,7 +274,7 @@ export class GameScene {
         mesh.position.x += (i - (mates.length - 1) / 2) * 0.38;
       }
       mesh.rotation.y = facingYaw(ship.facing);
-      mesh.visible = true;
+      mesh.visible = !ship.cloaked;
       paintBar(mesh, ship);
     }
     for (const [id, mesh] of this.ships) {
@@ -214,6 +283,38 @@ export class GameScene {
         this.ships.delete(id);
       }
     }
+    this.drawMarks();
+  }
+
+  setMarks(spec) {
+    this.markSpec = spec || null;
+    this.drawMarks();
+  }
+
+  drawMarks() {
+    if (this.marks) {
+      this.scene.remove(this.marks);
+      this.marks = null;
+    }
+    const spec = this.markSpec;
+    if (!spec) return;
+    const group = new THREE.Group();
+    const add = (shipId, kind) => {
+      const ship = this.ships.get(shipId);
+      if (!ship) return;
+      const mark = attackMark(kind);
+      mark.position.copy(ship.position);
+      mark.userData.baseY = ship.position.y;
+      group.add(mark);
+    };
+    if (spec.selected) add(spec.selected, "selected");
+    if (spec.shooter) add(spec.shooter, "shooter");
+    if (spec.target && spec.target !== spec.shooter) add(spec.target, "target");
+    group.traverse((obj) => {
+      obj.raycast = () => {};
+    });
+    this.marks = group;
+    this.scene.add(group);
   }
 
   addShipMesh(id, ship) {
@@ -268,6 +369,151 @@ export class GameScene {
     }
   }
 
+  setTable(cards) {
+    this.tableSpec = cards || [];
+    this.drawTable();
+  }
+
+  drawTable() {
+    if (this.table) {
+      this.scene.remove(this.table);
+      this.table = null;
+    }
+    const cards = this.tableSpec || [];
+    if (!cards.length) return;
+    const spots = [];
+    for (const card of cards) {
+      const ship = this.state?.ships?.find((s) => s.id === card.shipId);
+      if (!ship) continue;
+      spots.push(hexToWorld(ship.q, ship.r));
+    }
+    const ships = cards.filter((card) => card.row === "ship");
+    const gear = cards.filter((card) => card.row === "gear");
+    const lined = ships.length && gear.length ? [] : cards.filter((card) => card.row !== "ship" && card.row !== "gear");
+    const { center, yaw } = this.tablePose(spots, ships.length && gear.length ? 2.15 : 1.02);
+    const group = new THREE.Group();
+    group.position.copy(center);
+    group.position.y = 0.46;
+    group.rotation.y = yaw;
+    group.userData.kind = "table";
+    const placeRow = (list, z, gap) => {
+      const widths = list.map((card) => gap || (card.wide ? 2.05 : 1.45));
+      const total = widths.reduce((sum, width) => sum + width, 0);
+      let cursor = -total / 2;
+      list.forEach((card, index) => {
+        const width = widths[index];
+        cursor += width;
+        this.addTableCard(group, card, cursor - width / 2, z);
+      });
+    };
+    if (ships.length && gear.length) {
+      placeRow(ships, -1.2, 2.8);
+      placeRow(gear, 1.2, 0);
+    } else {
+      placeRow(lined.length ? lined : cards, 0, 2.8);
+    }
+    group.traverse((obj) => {
+      obj.raycast = () => {};
+    });
+    this.table = group;
+    this.tableCenter = center;
+    this.tableYaw = yaw;
+    this.scene.add(group);
+    if (this.handView) this.target.copy(center);
+  }
+
+  addTableCard(group, card, x, z) {
+    const wide = !!card.wide;
+    const width = wide ? 1.68 : 1.2;
+    const height = wide ? 1.18 : 1.68;
+    const slot = new THREE.Group();
+    slot.position.set(x, card.focus ? 0.08 : 0, z);
+    const plane = new THREE.Mesh(new THREE.PlaneGeometry(width, height), this.cardMaterial(card));
+    plane.rotation.x = -Math.PI / 2;
+    if (card.facedown) plane.rotation.z = Math.PI;
+    plane.position.y = 0.02;
+    if (card.spot) {
+      const [left, top] = card.spot;
+      const mark = new THREE.Mesh(
+        new THREE.CylinderGeometry(width * 0.044, width * 0.044, 0.04, 20),
+        new THREE.MeshBasicMaterial({ color: "#e0a020" })
+      );
+      mark.rotation.x = Math.PI / 2;
+      mark.position.set((left / 100 - 0.5) * width, (0.5 - top / 100) * height, 0.04);
+      plane.add(mark);
+    }
+    slot.add(plane);
+    if (card.color && !card.facedown) {
+      const token = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.13, 0.13, 0.05, 18),
+        new THREE.MeshBasicMaterial({ color: card.color })
+      );
+      token.position.set(width * 0.32, 0.08, height * 0.34);
+      slot.add(token);
+    }
+    const turns = Math.max(0, card.turn || 0);
+    for (let i = 0; i < turns; i++) {
+      const pip = new THREE.Mesh(
+        new THREE.ConeGeometry(0.07, 0.16, 3),
+        new THREE.MeshBasicMaterial({ color: card.turnDir === "left" ? "#7ec8ff" : "#ffb020" })
+      );
+      pip.rotation.x = Math.PI;
+      pip.position.set(-width * 0.35 + i * 0.18, 0.12, -height * 0.4);
+      slot.add(pip);
+    }
+    if (card.overdrive) {
+      const od = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.11, 0.11, 0.05, 14),
+        new THREE.MeshBasicMaterial({ color: "#ff5a4e" })
+      );
+      od.position.set(-width * 0.32, 0.08, height * 0.34);
+      slot.add(od);
+    }
+    const label = makeText(card.name || "", card.focus ? "#ffb020" : "#d7e7ff");
+    label.position.set(0, 0.2, height * 0.5 + 0.2);
+    slot.add(label);
+    group.add(slot);
+  }
+
+  cardMaterial(card) {
+    if (card.facedown || !card.art) return new THREE.MeshBasicMaterial({ color: "#1a1208", side: THREE.DoubleSide });
+    let map = this.cardTextures.get(card.art);
+    if (!map) {
+      map = new THREE.TextureLoader().load(card.art);
+      map.colorSpace = THREE.SRGBColorSpace;
+      this.cardTextures.set(card.art, map);
+    }
+    return new THREE.MeshBasicMaterial({ map, side: THREE.DoubleSide });
+  }
+
+  toggleHand() {
+    this.handView = !this.handView;
+    if (!this.handView) {
+      if (this.savedView) {
+        this.spherical.theta = this.savedView.theta;
+        this.spherical.phi = this.savedView.phi;
+        this.spherical.r = this.savedView.r;
+        this.target.copy(this.savedView.look);
+      }
+      return false;
+    }
+    if (!this.tableCenter) {
+      this.handView = false;
+      return null;
+    }
+    this.savedView = {
+      theta: this.spherical.theta,
+      phi: this.spherical.phi,
+      r: this.spherical.r,
+      look: this.target.clone(),
+    };
+    this.target.copy(this.tableCenter);
+    this.spherical.theta = this.tableYaw;
+    this.spherical.phi = 0.62;
+    this.spherical.r = 7.2;
+    return true;
+  }
+
   setPreview(paths) {
     this.lastPreview = paths || [];
     this.drawPreview();
@@ -299,7 +545,7 @@ export class GameScene {
     await Promise.all(moves.map((ev) => this.animateMove(ev)));
     for (const ev of pending) {
       if (ev.type === "collide") await this.flash(ev.a, "#ff5a4e");
-      else if (ev.type === "gyro") await this.slide(ev.shipId, ev.q, ev.r);
+      else if (ev.type === "gyro" || ev.type === "knock") await this.slide(ev.shipId, ev.q, ev.r);
       else if (ev.type === "bomb") {
         this.floatText(ev.q, ev.r, "BOMB", "#ff5a4e");
         await wait(160);
@@ -353,6 +599,7 @@ export class GameScene {
       mesh.userData.q = to.q;
       mesh.userData.r = to.r;
     }
+    mesh.rotation.y = facingYaw(ev.endFacing ?? ev.facing ?? 0);
   }
 
   async slide(id, q, r) {
@@ -461,7 +708,7 @@ export class GameScene {
     el.addEventListener("pointerleave", () => hideHexTip());
     el.addEventListener("wheel", (e) => {
       e.preventDefault();
-      this.spherical.r = clamp(this.spherical.r + e.deltaY * 0.01, 6, 40);
+      this.spherical.r = clamp(this.spherical.r + e.deltaY * 0.01, 8, 80);
     }, { passive: false });
   }
 
@@ -498,11 +745,140 @@ export class GameScene {
     return hits[0]?.object || null;
   }
 
+  playfieldReserve() {
+    if (this.isMobile() || !this.state) return 0;
+    const dock = document.getElementById("dock");
+    if (!dock || dock.classList.contains("collapsed")) return 0;
+    const box = dock.getBoundingClientRect();
+    if (box.width > 40 && box.height > 40) return Math.ceil(box.width + 16);
+    return 396;
+  }
+
+  foundationFootprint() {
+    const geo = this.models?.foundation;
+    const origins = this.foundationOrigins?.length ? this.foundationOrigins : [{ q: 0, r: 0 }];
+    if (!geo) return { minX: -8, maxX: 8, minZ: -8, maxZ: 8 };
+    if (!geo.boundingBox) geo.computeBoundingBox();
+    const pose = foundationPose();
+    const { min, max } = geo.boundingBox;
+    const c = Math.cos(pose.yaw);
+    const s = Math.sin(pose.yaw);
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (const origin of origins) {
+      const { x, z } = hexToWorld(origin.q || 0, origin.r || 0);
+      const cx = pose.x + x;
+      const cz = pose.z + z;
+      for (const sx of [min.x, max.x]) {
+        for (const sz of [min.z, max.z]) {
+          const lx = sx * pose.scale;
+          const lz = sz * pose.scale;
+          const wx = cx + lx * c + lz * s;
+          const wz = cz - lx * s + lz * c;
+          minX = Math.min(minX, wx);
+          maxX = Math.max(maxX, wx);
+          minZ = Math.min(minZ, wz);
+          maxZ = Math.max(maxZ, wz);
+        }
+      }
+    }
+    return { minX, maxX, minZ, maxZ };
+  }
+
+  plateCorners() {
+    const geo = this.models?.foundation;
+    const origins = this.foundationOrigins?.length ? this.foundationOrigins : [{ q: 0, r: 0 }];
+    if (!geo) return [{ x: -8, z: -8 }, { x: 8, z: -8 }, { x: -8, z: 8 }, { x: 8, z: 8 }];
+    if (!geo.boundingBox) geo.computeBoundingBox();
+    const pose = foundationPose();
+    const { min, max } = geo.boundingBox;
+    const c = Math.cos(pose.yaw);
+    const s = Math.sin(pose.yaw);
+    const corners = [];
+    for (const origin of origins) {
+      const { x, z } = hexToWorld(origin.q || 0, origin.r || 0);
+      const cx = pose.x + x;
+      const cz = pose.z + z;
+      for (const sx of [min.x, max.x]) {
+        for (const sz of [min.z, max.z]) {
+          const lx = sx * pose.scale;
+          const lz = sz * pose.scale;
+          corners.push({
+            x: cx + lx * c + lz * s,
+            z: cz - lx * s + lz * c,
+          });
+        }
+      }
+    }
+    return corners;
+  }
+
+  tablePose(spots, pad = 1.02) {
+    const mid = spots.length
+      ? spots.reduce((sum, spot) => ({ x: sum.x + spot.x, z: sum.z + spot.z }), { x: 0, z: 0 })
+      : { x: 0, z: 8 };
+    if (spots.length) {
+      mid.x /= spots.length;
+      mid.z /= spots.length;
+    }
+    const corners = this.plateCorners();
+    let cx = 0;
+    let cz = 0;
+    for (const corner of corners) {
+      cx += corner.x;
+      cz += corner.z;
+    }
+    cx /= corners.length;
+    cz /= corners.length;
+    let dx = mid.x - cx;
+    let dz = mid.z - cz;
+    const len = Math.hypot(dx, dz);
+    if (len < 0.2) {
+      dx = 0;
+      dz = 1;
+    } else {
+      dx /= len;
+      dz /= len;
+    }
+    const yaw = foundationPose().yaw;
+    const normals = [
+      [Math.sin(yaw), Math.cos(yaw)],
+      [-Math.sin(yaw), -Math.cos(yaw)],
+      [Math.cos(yaw), -Math.sin(yaw)],
+      [-Math.cos(yaw), Math.sin(yaw)],
+    ];
+    let nx = normals[0][0];
+    let nz = normals[0][1];
+    let best = -Infinity;
+    for (const [x, z] of normals) {
+      const dot = x * dx + z * dz;
+      if (dot > best) {
+        best = dot;
+        nx = x;
+        nz = z;
+      }
+    }
+    let support = 0;
+    for (const corner of corners) {
+      support = Math.max(support, (corner.x - cx) * nx + (corner.z - cz) * nz);
+    }
+    const t = support + pad;
+    return {
+      center: new THREE.Vector3(cx + nx * t, 0, cz + nz * t),
+      yaw: Math.atan2(nx, nz),
+    };
+  }
+
   resize() {
     const w = window.innerWidth;
     const h = window.innerHeight;
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
+    const reserve = this.playfieldReserve();
+    if (reserve) this.camera.setViewOffset(w + reserve, h, reserve, 0, w, h);
+    else this.camera.clearViewOffset();
     this.camera.updateProjectionMatrix();
   }
 
@@ -526,6 +902,12 @@ export class GameScene {
       if (!mesh.userData.bob) continue;
       mesh.position.y = 0.22 + Math.sin(t * 2 + mesh.id) * 0.04;
     }
+    if (this.marks) {
+      for (const mark of this.marks.children) {
+        const bob = mark.userData.baseY + Math.sin(t * 3 + (mark.userData.kind === "target" ? 1 : 0)) * 0.05;
+        mark.position.y = bob;
+      }
+    }
     for (const mesh of this.bombs.values()) {
       mesh.rotation.z += 0.01;
       mesh.position.y = 0.1 + Math.sin(t * 3) * 0.03;
@@ -538,6 +920,26 @@ export class GameScene {
 function place(obj, q, r, extra) {
   const { x, z } = hexToWorld(q, r);
   obj.position.set(x, tileDepth({ elevation: 0 }) + extra, z);
+}
+
+function purpleInwardRotation(origin, plates) {
+  let cx = 0;
+  let cz = 0;
+  for (const plate of plates) {
+    const spot = hexToWorld(plate.q || 0, plate.r || 0);
+    cx += spot.x;
+    cz += spot.z;
+  }
+  cx /= plates.length;
+  cz /= plates.length;
+  const here = hexToWorld(origin.q || 0, origin.r || 0);
+  const inward = Math.atan2(cx - here.x, cz - here.z);
+  const yaw = foundationPose().yaw;
+  const lx = -1;
+  const lz = -1;
+  const wx = lx * Math.cos(yaw) + lz * Math.sin(yaw);
+  const wz = -lx * Math.sin(yaw) + lz * Math.cos(yaw);
+  return inward - Math.atan2(wx, wz);
 }
 
 function facingYaw(facing) {
@@ -558,7 +960,7 @@ function parentKind(obj, kind) {
 function makeBar() {
   const mat = new THREE.SpriteMaterial({ transparent: true, depthTest: false });
   const sprite = new THREE.Sprite(mat);
-  sprite.scale.set(0.9, 0.22, 1);
+  sprite.scale.set(0.9, 0.34, 1);
   sprite.raycast = () => {};
   return sprite;
 }
@@ -568,11 +970,12 @@ function paintBar(mesh, ship) {
   if (!bar) return;
   const c = document.createElement("canvas");
   c.width = 128;
-  c.height = 32;
+  c.height = 48;
   const g = c.getContext("2d");
-  g.clearRect(0, 0, 128, 32);
-  pips(g, 4, 4, ship.shield, ship.shieldMax, "#3ee0ff");
-  pips(g, 4, 18, ship.hullHp, ship.hullMax, "#ffb020");
+  g.clearRect(0, 0, 128, 48);
+  pips(g, 4, 2, ship.shield, ship.shieldMax, "#3ee0ff");
+  pips(g, 4, 16, ship.armor || 0, ship.armorMax || 0, "#d5dbe6");
+  pips(g, 4, 30, ship.hullHp, ship.hullMax, "#ffb020");
   const tex = new THREE.CanvasTexture(c);
   if (bar.material.map) bar.material.map.dispose();
   bar.material.map = tex;
@@ -585,6 +988,32 @@ function pips(g, x, y, value, max, color) {
     g.fillStyle = i < value ? color : "rgba(255,255,255,0.18)";
     g.fillRect(x + i * 14, y, 10, 8);
   }
+}
+
+function attackMark(kind) {
+  const group = new THREE.Group();
+  const color = kind === "target" ? "#ff5a4e" : "#ffb020";
+  const onDeck = kind !== "target";
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(onDeck ? 0.62 : 0.46, onDeck ? 0.8 : 0.62, onDeck ? 6 : 28),
+    new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, transparent: true, opacity: 0.95 })
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = onDeck ? 0.06 : 1.05;
+  group.add(ring);
+  if (kind === "target") {
+    const tip = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.24, 8), new THREE.MeshBasicMaterial({ color }));
+    tip.rotation.x = Math.PI;
+    tip.position.y = 0.82;
+    group.add(tip);
+  }
+  const names = { shooter: "Firing", selected: "Selected", target: "Target" };
+  const label = makeText(names[kind] || "", color);
+  label.position.y = 1.32;
+  group.add(label);
+  group.userData.kind = kind;
+  group.userData.baseY = 0;
+  return group;
 }
 
 function makeText(text, color) {
